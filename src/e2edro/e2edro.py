@@ -29,38 +29,41 @@ if psutil.MACOS:
 #---------------------------------------------------------------------------------------------------
 # base_mod: CvxpyLayer that declares the portfolio optimization problem
 #---------------------------------------------------------------------------------------------------
-def base_mod(n_y, n_obs, prisk):
+def base_mod(n_y, n_obs, prisk, max_weight=1.0, long_short=False):
     """Base optimization problem declared as a CvxpyLayer object
 
     Inputs
     n_y: number of assets
     n_obs: Number of scenarios in the dataset
     prisk: Portfolio risk function. Not used in the code but included for the purpose of maintaining the optimization interface consistency.
-    
+    max_weight: Maximum weight per asset (default 1.0 = unconstrained long-only).
+    long_short: If True, allows short positions (removes nonneg constraint, adds z >= -max_weight).
+
     Variables
     z: Decision variable. (n_y x 1) vector of decision variables (e.g., portfolio weights)
-    
+
     Parameters
-    ep: (n_obs x n_y) matrix of residuals 
-    y_hat: (n_y x 1) vector of predicted outcomes (e.g., conditional expected
-    returns)
-    gamma: Scalar. Trade-off between conditional expected return and model error.
+    y_hat: (n_y x 1) vector of predicted outcomes
 
     Constraints
     Total budget is equal to 100%, sum(z) == 1
-    Long-only positions (no short sales), z >= 0 (specified during the cp.Variable() call)
+    Long-only by default; long_short=True removes non-negativity and adds symmetric short bound.
 
     Objective
     Minimize -y_hat @ z
     """
     # Variables
-    z = cp.Variable((n_y,1), nonneg=True)
+    z = cp.Variable((n_y, 1)) if long_short else cp.Variable((n_y, 1), nonneg=True)
 
     # Parameters
     y_hat = cp.Parameter(n_y)
-    
+
     # Constraints
     constraints = [cp.sum(z) == 1]
+    if max_weight < 1.0:
+        constraints.append(z <= max_weight)
+    if long_short:
+        constraints.append(z >= -max_weight)
 
     # Objective function
     objective = cp.Minimize(-y_hat @ z)
@@ -73,14 +76,16 @@ def base_mod(n_y, n_obs, prisk):
 #---------------------------------------------------------------------------------------------------
 # nominal: CvxpyLayer that declares the portfolio optimization problem
 #---------------------------------------------------------------------------------------------------
-def nominal(n_y, n_obs, prisk):
+def nominal(n_y, n_obs, prisk, max_weight=1.0, long_short=False):
     """Nominal optimization problem declared as a CvxpyLayer object
 
     Inputs
     n_y: number of assets
     n_obs: Number of scenarios in the dataset
     prisk: Portfolio risk function
-    
+    max_weight: Maximum weight per asset (default 1.0 = unconstrained long-only).
+    long_short: If True, allows short positions.
+
     Variables
     z: Decision variable. (n_y x 1) vector of decision variables (e.g., portfolio weights)
     c_aux: Auxiliary Variable. Scalar
@@ -88,20 +93,19 @@ def nominal(n_y, n_obs, prisk):
     mu_aux: Auxiliary Variable. Scalar. Represents the portfolio conditional expected return.
 
     Parameters
-    ep: (n_obs x n_y) matrix of residuals 
-    y_hat: (n_y x 1) vector of predicted outcomes (e.g., conditional expected
-    returns)
+    ep: (n_obs x n_y) matrix of residuals
+    y_hat: (n_y x 1) vector of predicted outcomes (e.g., conditional expected returns)
     gamma: Scalar. Trade-off between conditional expected return and model error.
 
     Constraints
     Total budget is equal to 100%, sum(z) == 1
-    Long-only positions (no short sales), z >= 0 (specified during the cp.Variable() call)
+    Long-only by default; long_short=True removes non-negativity and adds symmetric short bound.
 
     Objective
     Minimize (1/n_obs) * cp.sum(obj_aux) - gamma * mu_aux
     """
     # Variables
-    z = cp.Variable((n_y,1), nonneg=True)
+    z = cp.Variable((n_y, 1)) if long_short else cp.Variable((n_y, 1), nonneg=True)
     c_aux = cp.Variable()
     obj_aux = cp.Variable(n_obs)
     mu_aux = cp.Variable()
@@ -110,10 +114,13 @@ def nominal(n_y, n_obs, prisk):
     ep = cp.Parameter((n_obs, n_y))
     y_hat = cp.Parameter(n_y)
     gamma = cp.Parameter(nonneg=True)
-    
+
     # Constraints
-    constraints = [cp.sum(z) == 1,
-                    mu_aux == y_hat @ z]
+    constraints = [cp.sum(z) == 1, mu_aux == y_hat @ z]
+    if max_weight < 1.0:
+        constraints.append(z <= max_weight)
+    if long_short:
+        constraints.append(z >= -max_weight)
     for i in range(n_obs):
         constraints += [obj_aux[i] >= prisk(z, c_aux, ep[i])]
 
@@ -128,7 +135,7 @@ def nominal(n_y, n_obs, prisk):
 #---------------------------------------------------------------------------------------------------
 # Total Variation: sum_t abs(p_t - q_t) <= delta
 #---------------------------------------------------------------------------------------------------
-def tv(n_y, n_obs, prisk):
+def tv(n_y, n_obs, prisk, max_weight=1.0, long_short=False):
     """DRO layer using the 'Total Variation' distance to define the probability ambiguity set.
     From Ben-Tal et al. (2013).
     Total Variation: sum_t abs(p_t - q_t) <= delta
@@ -137,7 +144,9 @@ def tv(n_y, n_obs, prisk):
     n_y: Number of assets
     n_obs: Number of scenarios in the dataset
     prisk: Portfolio risk function
-    
+    max_weight: Maximum weight per asset (default 1.0 = unconstrained long-only).
+    long_short: If True, allows short positions.
+
     Variables
     z: Decision variable. (n_y x 1) vector of decision variables (e.g., portfolio weights)
     c_aux: Auxiliary Variable. Scalar. Allows us to p-linearize the derivation of the variance
@@ -146,25 +155,22 @@ def tv(n_y, n_obs, prisk):
     obj_aux: Auxiliary Variable. (n_obs x 1) vector. Allows for a tractable DR counterpart.
 
     Parameters
-    ep: (n_obs x n_y) matrix of residuals 
-    y_hat: (n_y x 1) vector of predicted outcomes (e.g., conditional expected
-    returns)
+    ep: (n_obs x n_y) matrix of residuals
+    y_hat: (n_y x 1) vector of predicted outcomes (e.g., conditional expected returns)
     delta: Scalar. Maximum distance between p and q.
     gamma: Scalar. Trade-off between conditional expected return and model error.
     mu_aux: Auxiliary Variable. Scalar. Represents the portfolio conditional expected return.
 
     Constraints
     Total budget is equal to 100%, sum(z) == 1
-    Long-only positions (no short sales), z >= 0 (specified during the cp.Variable() call)
-    All other constraints allow for a tractable DR counterpart. See the Appendix in Ben-Tal et al.
-    (2013).
+    Long-only by default; long_short=True removes non-negativity and adds symmetric short bound.
 
     Objective
     Minimize eta_aux + delta * lambda_aux + (1/n_obs) * sum(beta_aux) - gamma * y_hat @ z
     """
 
     # Variables
-    z = cp.Variable((n_y,1), nonneg=True)
+    z = cp.Variable((n_y, 1)) if long_short else cp.Variable((n_y, 1), nonneg=True)
     c_aux = cp.Variable()
     lambda_aux = cp.Variable(nonneg=True)
     eta_aux = cp.Variable()
@@ -176,11 +182,13 @@ def tv(n_y, n_obs, prisk):
     y_hat = cp.Parameter(n_y)
     gamma = cp.Parameter(nonneg=True)
     delta = cp.Parameter(nonneg=True)
-    
+
     # Constraints
-    constraints = [cp.sum(z) == 1,
-                    beta_aux >= -lambda_aux,
-                    mu_aux == y_hat @ z]
+    constraints = [cp.sum(z) == 1, beta_aux >= -lambda_aux, mu_aux == y_hat @ z]
+    if max_weight < 1.0:
+        constraints.append(z <= max_weight)
+    if long_short:
+        constraints.append(z >= -max_weight)
     for i in range(n_obs):
         constraints += [beta_aux[i] >= prisk(z, c_aux, ep[i]) - eta_aux]
         constraints += [lambda_aux >= prisk(z, c_aux, ep[i]) - eta_aux]
@@ -197,7 +205,7 @@ def tv(n_y, n_obs, prisk):
 #---------------------------------------------------------------------------------------------------
 # Hellinger distance: sum_t (sqrt(p_t) - sqrtq_t))^2 <= delta
 #---------------------------------------------------------------------------------------------------
-def hellinger(n_y, n_obs, prisk):
+def hellinger(n_y, n_obs, prisk, max_weight=1.0, long_short=False):
     """DRO layer using the Hellinger distance to define the probability ambiguity set.
     from Ben-Tal et al. (2013).
     Hellinger distance: sum_t (sqrt(p_t) - sqrtq_t))^2 <= delta
@@ -206,7 +214,9 @@ def hellinger(n_y, n_obs, prisk):
     n_y: number of assets
     n_obs: Number of scenarios in the dataset
     prisk: Portfolio risk function
-    
+    max_weight: Maximum weight per asset (default 1.0 = unconstrained long-only).
+    long_short: If True, allows short positions.
+
     Variables
     z: Decision variable. (n_y x 1) vector of decision variables (e.g., portfolio weights)
     c_aux: Auxiliary Variable. Scalar. Allows us to p-linearize the derivation of the variance
@@ -217,24 +227,21 @@ def hellinger(n_y, n_obs, prisk):
     mu_aux: Auxiliary Variable. Scalar. Represents the portfolio conditional expected return.
 
     Parameters
-    ep: (n_obs x n_y) matrix of residuals 
-    y_hat: (n_y x 1) vector of predicted outcomes (e.g., conditional expected
-    returns)
+    ep: (n_obs x n_y) matrix of residuals
+    y_hat: (n_y x 1) vector of predicted outcomes (e.g., conditional expected returns)
     delta: Scalar. Maximum distance between p and q.
     gamma: Scalar. Trade-off between conditional expected return and model error.
 
     Constraints
     Total budget is equal to 100%, sum(z) == 1
-    Long-only positions (no short sales), z >= 0 (specified during the cp.Variable() call)
-    All other constraints allow for a tractable DR counterpart. See the Appendix in Ben-Tal et al.
-    (2013).
+    Long-only by default; long_short=True removes non-negativity and adds symmetric short bound.
 
     Objective
     Minimize xi_aux + (delta-1) * lambda_aux + (1/n_obs) * sum(beta_aux) - gamma * y_hat @ z
     """
 
     # Variables
-    z = cp.Variable((n_y,1), nonneg=True)
+    z = cp.Variable((n_y, 1)) if long_short else cp.Variable((n_y, 1), nonneg=True)
     c_aux = cp.Variable()
     lambda_aux = cp.Variable(nonneg=True)
     xi_aux = cp.Variable()
@@ -249,25 +256,28 @@ def hellinger(n_y, n_obs, prisk):
     delta = cp.Parameter(nonneg=True)
 
     # Constraints
-    constraints = [cp.sum(z) == 1,
-                    mu_aux == y_hat @ z]
+    constraints = [cp.sum(z) == 1, mu_aux == y_hat @ z]
+    if max_weight < 1.0:
+        constraints.append(z <= max_weight)
+    if long_short:
+        constraints.append(z >= -max_weight)
     for i in range(n_obs):
         constraints += [xi_aux + lambda_aux >= prisk(z, c_aux, ep[i]) + tau_aux[i]]
         constraints += [beta_aux[i] >= cp.quad_over_lin(lambda_aux, tau_aux[i])]
-    
+
     # Objective function
-    objective = cp.Minimize(xi_aux + (delta-1) * lambda_aux + (1/n_obs) * cp.sum(beta_aux) 
+    objective = cp.Minimize(xi_aux + (delta-1) * lambda_aux + (1/n_obs) * cp.sum(beta_aux)
                             - gamma * mu_aux)
 
     # Construct optimization problem and differentiable layer
     problem = cp.Problem(objective, constraints)
-    
+
     return CvxpyLayer(problem, parameters=[ep, y_hat, gamma, delta], variables=[z])
 
 ####################################################################################################
 # base_rom: Estimation-robust layer (ellipsoidal uncertainty on μ̂)
 ####################################################################################################
-def base_rom(n_y, n_obs, prisk, sigma_mu_hat, max_weight=None):
+def base_rom(n_y, n_obs, prisk, sigma_mu_hat, max_weight=1.0, long_short=False):
     """Estimation-robust SOCP layer.
 
     Reformulates min_w max_{μ ∈ U(ε)} -μᵀw into the tractable SOCP:
@@ -283,7 +293,8 @@ def base_rom(n_y, n_obs, prisk, sigma_mu_hat, max_weight=None):
     n_obs: Number of scenarios (accepted for interface consistency, not used)
     prisk: Risk function (accepted for interface consistency, not used)
     sigma_mu_hat: (n_y x n_y) ndarray. Estimator covariance Σ_{μ̂} = B Cov(x) Bᵀ
-    max_weight: Optional float. Maximum weight per asset.
+    max_weight: Maximum weight per asset (default 1.0 = unconstrained long-only).
+    long_short: If True, allows short positions (removes nonneg, adds z >= -max_weight).
 
     CvxpyLayer parameters: [y_hat, epsilon]
     """
@@ -293,18 +304,20 @@ def base_rom(n_y, n_obs, prisk, sigma_mu_hat, max_weight=None):
     mask = eigvals > tol
     L_thin = eigvecs[:, mask] @ np.diag(np.sqrt(eigvals[mask]))  # (n_y, r), r <= n_x
 
-    z       = cp.Variable((n_y, 1), nonneg=True)
+    z       = cp.Variable((n_y, 1)) if long_short else cp.Variable((n_y, 1), nonneg=True)
     y_hat   = cp.Parameter(n_y)
     epsilon = cp.Parameter(nonneg=True)
 
     constraints = [cp.sum(z) == 1]
-    if max_weight is not None:
+    if max_weight < 1.0:
         if max_weight * n_y < 1.0:
             raise ValueError(
                 f"Infeasible: max_weight={max_weight} with n_y={n_y} assets. "
                 f"Need max_weight >= {1.0/n_y:.4f} (= 1/n_y) for feasibility."
             )
         constraints.append(z <= max_weight)
+    if long_short:
+        constraints.append(z >= -max_weight)
 
     # L_thin.T @ z is (r, 1) — affine in z (L_thin.T is a numpy constant) → DPP-compliant
     # epsilon is cp.Parameter(nonneg=True) multiplying a convex norm → DPP-compliant
@@ -335,7 +348,7 @@ class e2e_net(nn.Module):
     """End-to-end DRO learning neural net module.
     """
     def __init__(self, n_x, n_y, n_obs, opt_layer='nominal', prisk='p_var', perf_loss='sharpe_loss',
-                pred_model='linear', pred_loss_factor=0.5, perf_period=13, train_pred=True, train_gamma=True, train_delta=True, train_epsilon=True, set_seed=None, epochs=10, lr=1e-3, epsilon_lr=None, cache_path='./cache/', max_weight=None):
+                pred_model='linear', pred_loss_factor=0.5, perf_period=13, train_pred=True, train_gamma=True, train_delta=True, train_epsilon=True, set_seed=None, epochs=10, lr=1e-3, epsilon_lr=None, weight_decay=0.0, gamma_lr=None, long_short=False, cache_path='./cache/', max_weight=None):
         """End-to-end learning neural net module
 
         This NN module implements a linear prediction layer 'pred_layer' and a DRO layer 
@@ -376,6 +389,9 @@ class e2e_net(nn.Module):
         self.epochs = epochs  #it seems that i have to add it there is a call to self.epochs in train_net()
         self.lr = lr  #it seems that i have to add it there is a call to self.lr in train_net()
         self.epsilon_lr = epsilon_lr  # Separate learning rate for epsilon (if None, uses lr)
+        self.weight_decay = weight_decay  # L2 regularization on prediction weights only
+        self.gamma_lr = gamma_lr          # Separate learning rate for gamma/delta (portfolio params)
+        self.long_short = long_short      # Allow short positions if True
 
         # Store prisk for layer rebuild capability (used by base_rom)
         self.prisk_func = eval('rf.'+prisk)
@@ -456,9 +472,11 @@ class e2e_net(nn.Module):
             placeholder = np.eye(n_y)
             self.sigma_mu_hat = placeholder
             self._cov_x_cache = None  # populated by update_sigma_mu_hat before net_train
-            self.opt_layer = base_rom(n_y, n_obs, eval('rf.'+prisk), placeholder, max_weight)
+            self.opt_layer = base_rom(n_y, n_obs, eval('rf.'+prisk), placeholder,
+                                      max_weight=max_weight, long_short=long_short)
         else:
-            self.opt_layer = eval(opt_layer)(n_y, n_obs, eval('rf.'+prisk))
+            self.opt_layer = eval(opt_layer)(n_y, n_obs, eval('rf.'+prisk),
+                                             max_weight=max_weight, long_short=long_short)
         # Store reference path to store model data
         self.cache_path = cache_path
 
@@ -496,6 +514,33 @@ class e2e_net(nn.Module):
 
         
         torch.save(self.state_dict(), self.init_state_path)
+
+    #-----------------------------------------------------------------------------------------------
+    # calibrate_pred_loss_factor: balance loss scales at OLS initialization
+    #-----------------------------------------------------------------------------------------------
+    def calibrate_pred_loss_factor(self, X_train, Y_train, target_ratio=0.5):
+        """Set pred_loss_factor so the prediction co-objective has `target_ratio` weight
+        relative to the performance loss at the current (OLS) initialization.
+
+        Runs one no-grad forward pass on the training data, then updates self.pred_loss_factor.
+        Returns the calibrated value (or None if pred_loss is disabled).
+
+        target_ratio: fraction of the performance loss magnitude assigned to the prediction
+            term at initialization. E.g. 0.5 means prediction loss gets half the gradient
+            weight of the task loss at the start of training.
+        """
+        if self.pred_loss is None:
+            return None
+        loader = DataLoader(pc.SlidingWindow(X_train, Y_train, self.n_obs, self.perf_period))
+        self.eval()
+        with torch.no_grad():
+            x, y, y_perf = next(iter(loader))
+            z_star, y_hat = self(x.squeeze(), y.squeeze())
+            perf_l = abs(self.perf_loss(z_star, y_perf.squeeze()).item())
+            pred_l = abs(self.pred_loss(y_hat, y_perf.squeeze()[0]).item()) / self.n_y
+        if pred_l > 0:
+            self.pred_loss_factor = target_ratio * perf_l / pred_l
+        return self.pred_loss_factor
 
     #-----------------------------------------------------------------------------------------------
     # forward: forward pass of the e2e neural net
@@ -575,15 +620,19 @@ class e2e_net(nn.Module):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.to(device)
 
-        # Define the optimizer — support separate learning rate for epsilon
-        if self.epsilon_lr is not None and hasattr(self, 'epsilon') and self.epsilon.requires_grad:
-            param_groups = [
-                {'params': [p for n, p in self.named_parameters() if n != 'epsilon'], 'lr': lr},
-                {'params': [self.epsilon], 'lr': self.epsilon_lr}
-            ]
-            optimizer = torch.optim.Adam(param_groups)
-        else:
-            optimizer = torch.optim.Adam(self.parameters(), lr=lr)
+        # Build parameter groups: weight_decay on prediction weights only, zero on portfolio params
+        port_param_names = {'gamma', 'delta', 'epsilon'}
+        pred_params = [p for n, p in self.named_parameters() if n not in port_param_names]
+        free_port_params = [p for n, p in self.named_parameters()
+                            if n in ('gamma', 'delta') and p.requires_grad]
+        groups = [{'params': pred_params, 'lr': lr, 'weight_decay': self.weight_decay}]
+        if free_port_params:
+            g_lr = self.gamma_lr if self.gamma_lr is not None else lr
+            groups.append({'params': free_port_params, 'lr': g_lr, 'weight_decay': 0.0})
+        if hasattr(self, 'epsilon') and self.epsilon.requires_grad:
+            eps_lr = self.epsilon_lr if self.epsilon_lr is not None else lr
+            groups.append({'params': [self.epsilon], 'lr': eps_lr, 'weight_decay': 0.0})
+        optimizer = torch.optim.Adam(groups)
 
         # Number of elements in training set
         n_train = len(train_set)
@@ -633,7 +682,7 @@ class e2e_net(nn.Module):
                 self.sigma_mu_hat = sigma_mu_hat_new
                 self.opt_layer = base_rom(
                     self.n_y, self.n_obs, self.prisk_func,
-                    sigma_mu_hat_new, self.max_weight
+                    sigma_mu_hat_new, self.max_weight, long_short=self.long_short
                 )
 
         # Compute and return the validation loss of the model
@@ -703,7 +752,7 @@ class e2e_net(nn.Module):
 
         self.opt_layer = base_rom(
             self.n_y, self.n_obs, self.prisk_func,
-            sigma_mu_hat_new, self.max_weight
+            sigma_mu_hat_new, self.max_weight, long_short=self.long_short
         )
 
         eigvals = np.linalg.eigvalsh(sigma_mu_hat_new)

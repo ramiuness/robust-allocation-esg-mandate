@@ -1,10 +1,14 @@
 """
 Utilities for base_rom_demo.ipynb.
 Metric computation, running drawdown, and all plot functions.
+Matplotlib versions (_mpl suffix, or default names) for static notebooks.
+Plotly versions (_px suffix) for interactive notebooks.
 """
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # ---------------------------------------------------------------------------
 # Color / style registry
@@ -187,3 +191,74 @@ def plot_all_wealth(all_names, all_ports, figsize=(12, 6)):
     ax.tick_params(axis='x', rotation=45)
     plt.tight_layout()
     plt.show()
+
+
+# ---------------------------------------------------------------------------
+# Plotly interactive versions (used in e2e_ro_vs_dro_2.ipynb)
+# ---------------------------------------------------------------------------
+def _px_dash(ls):
+    return 'dash' if ls == '--' else 'solid'
+
+
+def plot_all_wealth_px(all_names, all_ports):
+    """Interactive cumulative wealth chart (Plotly). Legend placed outside right."""
+    dates = [d.strftime('%Y-%m-%d') for d in all_ports[0].rets.index]
+    fig = go.Figure()
+    for name, port in zip(all_names, all_ports):
+        color, ls = COLORS[name]
+        fig.add_trace(go.Scatter(
+            x=dates, y=port.rets['tri'].values.tolist(),
+            mode='lines', name=name,
+            line=dict(color=color, dash=_px_dash(ls), width=2.5 if 'ROM' in name else 1.8)
+        ))
+    fig.update_layout(
+        title='All Models: Cumulative Wealth',
+        xaxis_title='Date', yaxis_title='Cumulative Wealth',
+        hovermode='x unified',
+        legend=dict(x=1.01, y=0.5, xanchor='left', yanchor='middle'),
+        margin=dict(r=180),
+        height=500
+    )
+    fig.show()
+
+
+def plot_drawdown_px(names, portfolios, title):
+    """Interactive running drawdown chart (Plotly). Legend placed outside right."""
+    dates = [d.strftime('%Y-%m-%d') for d in portfolios[0].rets.index]
+    fig = go.Figure()
+    for name, port in zip(names, portfolios):
+        color, ls = COLORS[name]
+        fig.add_trace(go.Scatter(
+            x=dates, y=running_dd(port).values.tolist(),
+            mode='lines', name=name,
+            line=dict(color=color, dash=_px_dash(ls), width=1.5)
+        ))
+    fig.add_hline(y=0, line=dict(color='black', width=0.5))
+    fig.update_layout(
+        title=title,
+        xaxis_title='Date', yaxis_title='Drawdown',
+        hovermode='x unified',
+        legend=dict(x=1.01, y=0.5, xanchor='left', yanchor='middle'),
+        margin=dict(r=180),
+        height=420
+    )
+    fig.show()
+
+
+def plot_summary_bars_px(all_names, all_metrics):
+    """Interactive horizontal bar chart — Sharpe and Effective Holdings (Plotly)."""
+    bar_colors = [COLORS[n][0] for n in all_names]
+    fig = make_subplots(rows=1, cols=2,
+                        subplot_titles=['Sharpe Ratio', 'Effective Holdings'])
+    fig.add_trace(go.Bar(
+        y=all_names, x=all_metrics['Sharpe'].values.tolist(),
+        orientation='h', marker_color=bar_colors, showlegend=False,
+        hovertemplate='%{y}: %{x:.3f}<extra></extra>'
+    ), row=1, col=1)
+    fig.add_trace(go.Bar(
+        y=all_names, x=all_metrics['Eff. Holdings'].values.tolist(),
+        orientation='h', marker_color=bar_colors, showlegend=False,
+        hovertemplate='%{y}: %{x:.2f}<extra></extra>'
+    ), row=1, col=2)
+    fig.update_layout(title='Performance Summary', hovermode='closest', height=420)
+    fig.show()

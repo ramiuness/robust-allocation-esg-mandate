@@ -23,38 +23,41 @@ import e2edro.e2edro as e2e
 #---------------------------------------------------------------------------------------------------
 # base_mod: CvxpyLayer that declares the portfolio optimization problem
 #---------------------------------------------------------------------------------------------------
-def base_mod(n_y, n_obs, prisk):
+def base_mod(n_y, n_obs, prisk, max_weight=1.0, long_short=False):
     """Base optimization problem declared as a CvxpyLayer object
 
     Inputs
     n_y: number of assets
     n_obs: Number of scenarios in the dataset
     prisk: Portfolio risk function. Not used in the code but included for the purpose of maintaining the optimization interface consistency.
-    
+    max_weight: Maximum weight per asset (default 1.0 = unconstrained long-only).
+    long_short: If True, allows short positions (removes nonneg constraint, adds z >= -max_weight).
+
     Variables
     z: Decision variable. (n_y x 1) vector of decision variables (e.g., portfolio weights)
-    
+
     Parameters
-    ep: (n_obs x n_y) matrix of residuals 
-    y_hat: (n_y x 1) vector of predicted outcomes (e.g., conditional expected
-    returns)
-    gamma: Scalar. Trade-off between conditional expected return and model error.
+    y_hat: (n_y x 1) vector of predicted outcomes
 
     Constraints
     Total budget is equal to 100%, sum(z) == 1
-    Long-only positions (no short sales), z >= 0 (specified during the cp.Variable() call)
+    Long-only by default; long_short=True removes non-negativity and adds symmetric short bound.
 
     Objective
     Minimize -y_hat @ z
     """
     # Variables
-    z = cp.Variable((n_y,1), nonneg=True)
+    z = cp.Variable((n_y, 1)) if long_short else cp.Variable((n_y, 1), nonneg=True)
 
     # Parameters
     y_hat = cp.Parameter(n_y)
-    
+
     # Constraints
     constraints = [cp.sum(z) == 1]
+    if max_weight < 1.0:
+        constraints.append(z <= max_weight)
+    if long_short:
+        constraints.append(z >= -max_weight)
 
     # Objective function
     objective = cp.Minimize(-y_hat @ z)
@@ -70,7 +73,7 @@ def base_mod(n_y, n_obs, prisk):
 class pred_then_opt(nn.Module):
     """Naive 'predict-then-optimize' portfolio construction module
     """
-    def __init__(self, n_x, n_y, n_obs, epsilon=0.5, set_seed=None, prisk='p_var', opt_layer='nominal', cache_path='./cache/', max_weight=None):
+    def __init__(self, n_x, n_y, n_obs, epsilon=0.5, set_seed=None, prisk='p_var', opt_layer='nominal', cache_path='./cache/', max_weight=None, long_short=False):
         """Naive 'predict-then-optimize' portfolio construction module
 
         This NN module implements a linear prediction layer 'pred_layer' and an optimization layer 
@@ -95,6 +98,7 @@ class pred_then_opt(nn.Module):
         self.n_y = n_y
         self.n_obs = n_obs
         self.max_weight = max_weight  # Max weight per asset for diversification
+        self.long_short = long_short  # Allow short positions if True
         self.perf_period = 13
 
         # Store epsilon and prisk for layer rebuild capability
@@ -135,13 +139,16 @@ class pred_then_opt(nn.Module):
 
         # LAYER: Optimization model
         if opt_layer == 'base_mod':
-            self.opt_layer = base_mod(n_y, n_obs, eval('rf.'+prisk))
+            self.opt_layer = base_mod(n_y, n_obs, eval('rf.'+prisk),
+                                      max_weight=max_weight, long_short=long_short)
         elif opt_layer == 'base_rom':
             placeholder = np.eye(n_y)
             self.sigma_mu_hat = placeholder
-            self.opt_layer = e2e.base_rom(n_y, n_obs, eval('rf.'+prisk), placeholder, max_weight)
+            self.opt_layer = e2e.base_rom(n_y, n_obs, eval('rf.'+prisk), placeholder,
+                                          max_weight=max_weight, long_short=long_short)
         else:
-            self.opt_layer = eval(opt_layer)(n_y, n_obs, eval('rf.'+prisk))
+            self.opt_layer = eval(opt_layer)(n_y, n_obs, eval('rf.'+prisk),
+                                             max_weight=max_weight, long_short=long_short)
         # Store reference path to store model data
         self.cache_path = cache_path
 
@@ -302,7 +309,7 @@ class pred_then_opt(nn.Module):
 
         self.opt_layer = e2e.base_rom(
             self.n_y, self.n_obs, self.prisk_func,
-            sigma_mu_hat_new, self.max_weight
+            sigma_mu_hat_new, self.max_weight, long_short=self.long_short
         )
 
         diagnostics['updated'] = True
