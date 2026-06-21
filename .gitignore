@@ -1,0 +1,24 @@
+# Excluded from version control
+docs/
+notebooks/
+
+# Data and figures (generated)
+data/
+figs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model cache
+cache/
+
+# OS
+.DS_Store
