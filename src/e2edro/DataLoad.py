@@ -556,6 +556,116 @@ def fetch_market_data(start:str, end:str, split:list, freq:str='weekly', n_obs:i
     return TrainTest(X_aligned[:-1], n_obs, split), TrainTest(Y_aligned[1:], n_obs, split)
 
 ####################################################################################################
+# Fetch market data from local CSV files (no network required)
+####################################################################################################
+def fetch_data_from_disk(split: list, freq: str = 'weekly', n_obs: int = 104,
+                         n_y: int = None, data_dir: str = './data',
+                         use_cache: bool = False, save_results: bool = False):
+    """Load market and factor data from local CSV files.
+
+    Reads S&P 500 returns from sp_meta.csv, Fama-French 6 factors from
+    factor_panel_long.csv, 5 macro innovations from macro_panel_daily_long.csv,
+    and an ESG factor from esg_factor.csv. Date range is determined automatically
+    by the inner join of all sources (~2020-01-02 to 2025-12-31).
+
+    Features (X, 12 total):
+        FF6  — MKT, SMB, HML, RMW, CMA, MOM
+        Macro — DGS10 (Δ10y yield bp), T5YIFR (Δ5y5y breakeven bp),
+                DCOILWTICO (WTI log-ret), DHHNGSP (NG log-ret), VIXCLS (ΔVIX)
+        ESG  — composite ESG factor return
+
+    Parameters
+    ----------
+    split : list
+        Train-test split as percentages (must sum to 1).
+    freq : str, optional
+        Data frequency ('daily' or 'weekly'). The default is 'weekly'.
+    n_obs : int, optional
+        Number of observations per rolling batch. The default is 104.
+    n_y : int, optional
+        Number of assets to select (alphabetical). If None, all clean
+        tickers are used. The default is None.
+    data_dir : str, optional
+        Directory containing the data CSVs. The default is './data'.
+    use_cache : bool, optional
+        Load pre-built pickles from ./cache/ instead of reading CSVs.
+        The default is False.
+    save_results : bool, optional
+        Pickle X and Y to ./cache/ after building. The default is False.
+
+    Returns
+    -------
+    X : TrainTest
+        Feature data split into train and test subsets.
+    Y : TrainTest
+        Asset return data split into train and test subsets.
+    """
+    if use_cache:
+        X = pd.read_pickle('./cache/disk_factor_' + freq + '.pkl')
+        Y = pd.read_pickle('./cache/disk_asset_' + freq + '.pkl')
+    else:
+        ff_names    = ['MKT-RF', 'SMB', 'HML', 'RMW', 'CMA', 'MOM']
+        macro_names = ['DGS10', 'T5YIFR', 'DCOILWTICO', 'DHHNGSP', 'VIXCLS']
+        final_cols  = ['MKT', 'SMB', 'HML', 'RMW', 'CMA', 'MOM',
+                       'DGS10', 'T5YIFR', 'DCOILWTICO', 'DHHNGSP', 'VIXCLS', 'esg']
+        overlap_start, overlap_end = '2020-01-02', '2025-12-31'
+
+        # -- Y: asset returns -------------------------------------------------
+        sp = pd.read_csv(data_dir + '/sp_meta.csv', index_col=0, parse_dates=['Date'])
+        Y = sp.pivot_table(index='Date', columns='Symbol', values='Adj Close')
+        Y.columns.name = None
+        Y = Y.pct_change(fill_method=None).dropna(how='all')
+        # drop tickers with any NaN in the overlap window before resampling
+        window = Y.loc[overlap_start:overlap_end]
+        clean  = window.columns[window.isna().sum() == 0]
+        Y = Y[clean]
+        if n_y is not None:
+            Y = Y.iloc[:, :n_y]
+
+        # -- FF factors -------------------------------------------------------
+        fp = pd.read_csv(data_dir + '/factor_panel_long.csv', parse_dates=['date'])
+        fp = fp[(fp['frequency'] == 'daily') & (fp['factor'].isin(ff_names))]
+        ff = fp.pivot_table(index='date', columns='factor', values='value')[ff_names]
+        ff.columns.name = None
+        ff = ff.rename(columns={'MKT-RF': 'MKT'})
+
+        # -- macro innovations ------------------------------------------------
+        mp = pd.read_csv(data_dir + '/macro_panel_daily_long.csv', parse_dates=['date'])
+        mp = mp[(mp['kind'] == 'innov') & (mp['series'].isin(macro_names))]
+        macro = mp.pivot_table(index='date', columns='series', values='value')[macro_names]
+        macro.columns.name = None
+
+        # -- ESG factor -------------------------------------------------------
+        esg_raw = pd.read_csv(data_dir + '/esg_factor.csv', index_col=0)
+        esg_raw.index = pd.to_datetime(esg_raw['index'])
+        esg = esg_raw[['esg']]
+
+        # -- weekly resampling ------------------------------------------------
+        if freq == 'weekly':
+            compound = lambda x: (x + 1).prod() - 1
+            Y     = Y.resample('W-FRI').agg(compound)
+            ff_w  = ff.resample('W-FRI').agg(compound)
+            esg_w = esg.resample('W-FRI').agg(compound)
+            # macro innovations are additive: bp-changes and log-returns both sum
+            mac_w = macro.resample('W-FRI').sum(min_count=1)
+            X = pd.concat([ff_w, mac_w, esg_w], axis=1)[final_cols]
+        else:
+            X = pd.concat([ff, macro, esg], axis=1)[final_cols]
+
+        # -- align and clean --------------------------------------------------
+        X = X.dropna()
+        common = X.index.intersection(Y.index)
+        X = X.loc[common]
+        Y = Y.loc[common].dropna(axis=1)
+
+        if save_results:
+            X.to_pickle('./cache/disk_factor_' + freq + '.pkl')
+            Y.to_pickle('./cache/disk_asset_' + freq + '.pkl')
+
+    # X[t] predicts Y[t+1] — lag by one observation to avoid look-ahead bias
+    return TrainTest(X[:-1], n_obs, split), TrainTest(Y[1:], n_obs, split)
+
+####################################################################################################
 # Deprecated alias for backward compatibility
 ####################################################################################################
 def AV(*args, **kwargs):
