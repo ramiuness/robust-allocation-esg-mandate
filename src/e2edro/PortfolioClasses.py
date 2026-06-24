@@ -43,7 +43,7 @@ class SlidingWindow(Dataset):
     def __getitem__(self, index):
         x = self.X[index:index+self.n_obs+1]
         y = self.Y[index:index+self.n_obs]
-        y_perf = self.Y[index+self.n_obs : index+self.n_obs+self.perf_period+1]
+        y_perf = self.Y[index+self.n_obs : index+self.n_obs+self.perf_period]
         return (x, y, y_perf)
 
     def __len__(self):
@@ -87,6 +87,9 @@ class backtest:
         Computes: mean, vol, sharpe, sortino, max_drawdown, turnover, effective_holdings
         Then converts self.rets to DataFrame with columns ['rets', 'tri'].
         """
+        if isinstance(self.rets, pd.DataFrame):
+            return
+
         # Compute all metrics while self.rets is still a numpy array
         tri = np.cumprod(self.rets + 1)
 

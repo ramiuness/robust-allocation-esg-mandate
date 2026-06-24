@@ -37,7 +37,7 @@ def single_period_over_var_loss(z_star, y_perf):
     Output
     loss: realized return at time 't' over realized volatility from 't' to 't + perf_period'
     """
-    loss = -y_perf[0] @ z_star / torch.std(y_perf @ z_star)
+    loss = -y_perf[0] @ z_star / torch.std(y_perf @ z_star).clamp(min=1e-8)
     return loss
 
 def sharpe_loss(z_star, y_perf):
@@ -54,5 +54,5 @@ def sharpe_loss(z_star, y_perf):
     Output
     loss: realized average return over realized volatility from 't' to 't + perf_period'
     """
-    loss = -torch.mean(y_perf @ z_star) / torch.std(y_perf @ z_star)
+    loss = -torch.mean(y_perf @ z_star) / torch.std(y_perf @ z_star).clamp(min=1e-8)
     return loss

@@ -73,7 +73,7 @@ def base_mod(n_y, n_obs, prisk, max_weight=1.0, long_short=False):
 class pred_then_opt(nn.Module):
     """Naive 'predict-then-optimize' portfolio construction module
     """
-    def __init__(self, n_x, n_y, n_obs, epsilon=0.5, set_seed=None, prisk='p_var', opt_layer='nominal', cache_path='./cache/', max_weight=None, long_short=False):
+    def __init__(self, n_x, n_y, n_obs, epsilon=0.5, set_seed=None, prisk='p_var', opt_layer='nominal', cache_path='./cache/', max_weight=1.0, long_short=False):
         """Naive 'predict-then-optimize' portfolio construction module
 
         This NN module implements a linear prediction layer 'pred_layer' and an optimization layer 
@@ -236,14 +236,13 @@ class pred_then_opt(nn.Module):
 
             test_set = DataLoader(pc.SlidingWindow(X.test(), Y.test(), self.n_obs, 0))
 
-            X_train, Y_train = X.train(), Y.train()
+            X_train, Y_train = X.train().copy(), Y.train()
             X_train.insert(0,'ones', 1.0)
 
             X_train = Variable(torch.tensor(X_train.values, dtype=torch.double))
             Y_train = Variable(torch.tensor(Y_train.values, dtype=torch.double))
-        
-            Theta = torch.inverse(X_train.T @ X_train) @ (X_train.T @ Y_train)
-            Theta = Theta.T
+
+            Theta = torch.linalg.lstsq(X_train, Y_train).solution.T
             del X_train, Y_train
 
             with torch.no_grad():
@@ -456,14 +455,13 @@ class gamma_range(nn.Module):
         """
 
         # Initialize the prediction layer weights to OLS regression weights
-        X_train, Y_train = X.train(), Y.train()
+        X_train, Y_train = X.train().copy(), Y.train()
         X_train.insert(0,'ones', 1.0)
 
         X_train = Variable(torch.tensor(X_train.values, dtype=torch.double))
         Y_train = Variable(torch.tensor(Y_train.values, dtype=torch.double))
-    
-        Theta = torch.inverse(X_train.T @ X_train) @ (X_train.T @ Y_train)
-        Theta = Theta.T
+
+        Theta = torch.linalg.lstsq(X_train, Y_train).solution.T
         del X_train, Y_train
 
         with torch.no_grad():

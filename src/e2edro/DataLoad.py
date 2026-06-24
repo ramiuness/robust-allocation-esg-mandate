@@ -646,7 +646,7 @@ def fetch_data_from_disk(start: str, end: str, split: list, freq: str = 'weekly'
 
         # -- ESG factor -------------------------------------------------------
         esg_raw = pd.read_csv(data_dir + '/esg_factor.csv', index_col=0)
-        esg_raw.index = pd.to_datetime(esg_raw['index'])
+        esg_raw.index = pd.to_datetime(esg_raw.index)
         esg = esg_raw[['esg']]
 
         # -- weekly resampling ------------------------------------------------

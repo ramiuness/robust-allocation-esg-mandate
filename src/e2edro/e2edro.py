@@ -481,31 +481,30 @@ class e2e_net(nn.Module):
         self.cache_path = cache_path
 
         # Store initial model. During every rolling-window, back-test, or cross-validation fold, the code needs to reset the network to a clean "initial" state before retraining on the new window.
+        _hw = f'_mw{max_weight}_ls{long_short}'
         if self.model_type == 'base_mod':
-            self.init_state_path = (
-                        cache_path
-                        + self.model_type
-                        + '_initial_state_'
-                        + pred_model
-                    )
+            self.init_state_path = (cache_path + self.model_type
+                                    + '_initial_state_' + pred_model + _hw)
         elif self.model_type == 'base_rom':
-        # Estimation-robust layer: epsilon may or may not be learnable
-            self.init_state_path = (
-                        cache_path
-                        + self.model_type
-                        + '_initial_state_'
-                        + pred_model
-                        + '_TrainEpsilon'
-                        + str(train_epsilon)
-                    )
+            self.init_state_path = (cache_path + self.model_type
+                                    + '_initial_state_' + pred_model
+                                    + '_TrainEpsilon' + str(train_epsilon) + _hw)
         elif train_gamma and train_delta:
-            self.init_state_path = cache_path + self.model_type+'_initial_state_' + pred_model
+            self.init_state_path = (cache_path + self.model_type
+                                    + '_initial_state_' + pred_model + _hw)
         elif train_delta and not train_gamma:
-            self.init_state_path = cache_path + self.model_type+'_initial_state_' + pred_model + '_TrainGamma'+str(train_gamma)
+            self.init_state_path = (cache_path + self.model_type
+                                    + '_initial_state_' + pred_model
+                                    + '_TrainDelta' + str(train_delta) + _hw)
         elif train_gamma and not train_delta:
-            self.init_state_path = cache_path + self.model_type+'_initial_state_' + pred_model + '_TrainDelta'+str(train_delta)
+            self.init_state_path = (cache_path + self.model_type
+                                    + '_initial_state_' + pred_model
+                                    + '_TrainGamma' + str(train_gamma) + _hw)
         elif not train_gamma and not train_delta:
-            self.init_state_path = cache_path + self.model_type+'_initial_state_' + pred_model + '_TrainGamma'+str(train_gamma) + '_TrainDelta'+str(train_delta)
+            self.init_state_path = (cache_path + self.model_type
+                                    + '_initial_state_' + pred_model
+                                    + '_TrainGamma' + str(train_gamma)
+                                    + '_TrainDelta' + str(train_delta) + _hw)
         # Store a checkpoint of the just-initialised weights. Restores the pristine state before each new roll (such as in net_roll_test
   # Make sure this is imported at the top
 
@@ -700,7 +699,7 @@ class e2e_net(nn.Module):
                     z_val, y_val = self(x.squeeze(), y.squeeze())
                 
                     # Loss function
-                    if self.pred_loss_factor is None:
+                    if self.pred_loss is None:
                         loss = (1/n_val) * self.perf_loss(z_val, y_perf.squeeze())
                     else:
                         loss = (1/n_val) * (self.perf_loss(z_val, y_perf.squeeze()) + 
@@ -809,14 +808,13 @@ class e2e_net(nn.Module):
 
                     if self.pred_model == 'linear':
                         # Initialize the prediction layer weights to OLS regression weights
-                        X_train, Y_train = X_temp.train(), Y_temp.train()
+                        X_train, Y_train = X_temp.train().copy(), Y_temp.train()
                         X_train.insert(0,'ones', 1.0)
 
                         X_train = Variable(torch.tensor(X_train.values, dtype=torch.double))
                         Y_train = Variable(torch.tensor(Y_train.values, dtype=torch.double))
-                    
-                        Theta = torch.inverse(X_train.T @ X_train) @ (X_train.T @ Y_train)
-                        Theta = Theta.T
+
+                        Theta = torch.linalg.lstsq(X_train, Y_train).solution.T
                         del X_train, Y_train
 
                         with torch.no_grad():
@@ -915,17 +913,14 @@ class e2e_net(nn.Module):
 
             if self.pred_model == 'linear':
                 # Initialize the prediction layer weights to OLS regression weights
-                X_train, Y_train = X.train(), Y.train()
+                X_train, Y_train = X.train().copy(), Y.train()
                 X_train.insert(0,'ones', 1.0)
-            
-                # Move tensors to the same device as the model
+
                 device = self.pred_layer.weight.device
-                X_train = torch.tensor(X_train.values, dtype=torch.double, device=device)
-                Y_train = torch.tensor(Y_train.values, dtype=torch.double, device=device)
-                
-                Theta = torch.inverse(X_train.T @ X_train) @ (X_train.T @ Y_train)
-                Theta = Theta.T
-                del X_train, Y_train
+                X_cpu = torch.tensor(X_train.values, dtype=torch.double)
+                Y_cpu = torch.tensor(Y_train.values, dtype=torch.double)
+                Theta = torch.linalg.lstsq(X_cpu, Y_cpu).solution.T.to(device)
+                del X_train, Y_train, X_cpu, Y_cpu
 
                 with torch.no_grad():
                     self.pred_layer.bias.copy_(Theta[:,0])
