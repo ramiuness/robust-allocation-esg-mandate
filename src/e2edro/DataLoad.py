@@ -558,15 +558,15 @@ def fetch_market_data(start:str, end:str, split:list, freq:str='weekly', n_obs:i
 ####################################################################################################
 # Fetch market data from local CSV files (no network required)
 ####################################################################################################
-def fetch_data_from_disk(split: list, freq: str = 'weekly', n_obs: int = 104,
+def fetch_data_from_disk(start: str, end: str, split: list, freq: str = 'weekly', n_obs: int = 104,
                          n_y: int = None, data_dir: str = './data',
                          use_cache: bool = False, save_results: bool = False):
     """Load market and factor data from local CSV files.
 
     Reads S&P 500 returns from sp_meta.csv, Fama-French 6 factors from
     factor_panel_long.csv, 5 macro innovations from macro_panel_daily_long.csv,
-    and an ESG factor from esg_factor.csv. Date range is determined automatically
-    by the inner join of all sources (~2020-01-02 to 2025-12-31).
+    and an ESG factor from esg_factor.csv. The effective date range is clamped
+    to the data availability window (~2020-01-02 to 2025-12-31).
 
     Features (X, 12 total):
         FF6  — MKT, SMB, HML, RMW, CMA, MOM
@@ -576,6 +576,10 @@ def fetch_data_from_disk(split: list, freq: str = 'weekly', n_obs: int = 104,
 
     Parameters
     ----------
+    start : str
+        Start date of time series (ISO format, e.g. '2020-01-02').
+    end : str
+        End date of time series (ISO format, e.g. '2024-12-31').
     split : list
         Train-test split as percentages (must sum to 1).
     freq : str, optional
@@ -600,23 +604,28 @@ def fetch_data_from_disk(split: list, freq: str = 'weekly', n_obs: int = 104,
     Y : TrainTest
         Asset return data split into train and test subsets.
     """
+    overlap_start, overlap_end = '2020-01-02', '2025-12-31'
+    effective_start = max(overlap_start, start)
+    effective_end   = min(overlap_end, end)
+
     if use_cache:
         X = pd.read_pickle('./cache/disk_factor_' + freq + '.pkl')
         Y = pd.read_pickle('./cache/disk_asset_' + freq + '.pkl')
+        X = X.loc[effective_start:effective_end]
+        Y = Y.loc[effective_start:effective_end]
     else:
         ff_names    = ['MKT-RF', 'SMB', 'HML', 'RMW', 'CMA', 'MOM']
         macro_names = ['DGS10', 'T5YIFR', 'DCOILWTICO', 'DHHNGSP', 'VIXCLS']
         final_cols  = ['MKT', 'SMB', 'HML', 'RMW', 'CMA', 'MOM',
                        'DGS10', 'T5YIFR', 'DCOILWTICO', 'DHHNGSP', 'VIXCLS', 'esg']
-        overlap_start, overlap_end = '2020-01-02', '2025-12-31'
 
         # -- Y: asset returns -------------------------------------------------
         sp = pd.read_csv(data_dir + '/sp_meta.csv', index_col=0, parse_dates=['Date'])
         Y = sp.pivot_table(index='Date', columns='Symbol', values='Adj Close')
         Y.columns.name = None
         Y = Y.pct_change(fill_method=None).dropna(how='all')
-        # drop tickers with any NaN in the overlap window before resampling
-        window = Y.loc[overlap_start:overlap_end]
+        # drop tickers with any NaN in the effective window before resampling
+        window = Y.loc[effective_start:effective_end]
         clean  = window.columns[window.isna().sum() == 0]
         Y = Y[clean]
         if n_y is not None:
@@ -657,6 +666,9 @@ def fetch_data_from_disk(split: list, freq: str = 'weekly', n_obs: int = 104,
         common = X.index.intersection(Y.index)
         X = X.loc[common]
         Y = Y.loc[common].dropna(axis=1)
+
+        X = X.loc[effective_start:effective_end]
+        Y = Y.loc[effective_start:effective_end]
 
         if save_results:
             X.to_pickle('./cache/disk_factor_' + freq + '.pkl')
