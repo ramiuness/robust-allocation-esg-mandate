@@ -906,7 +906,7 @@ class e2e_net(nn.Module):
             X.split_update(split), Y.split_update(split)
 
             train_set = DataLoader(pc.SlidingWindow(X.train(), Y.train(), self.n_obs, self.perf_period))
-            test_set = DataLoader(pc.SlidingWindow(X.test(), Y.test(), self.n_obs, 0))
+            test_set = DataLoader(pc.SlidingWindow(X.test(), Y.test(), self.n_obs, 1))
 
             # Reset learnable parameters gamma and delta
             self.load_state_dict(torch.load(self.init_state_path))

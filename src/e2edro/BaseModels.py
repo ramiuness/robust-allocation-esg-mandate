@@ -234,7 +234,7 @@ class pred_then_opt(nn.Module):
 
             X.split_update(split), Y.split_update(split)
 
-            test_set = DataLoader(pc.SlidingWindow(X.test(), Y.test(), self.n_obs, 0))
+            test_set = DataLoader(pc.SlidingWindow(X.test(), Y.test(), self.n_obs, 1))
 
             X_train, Y_train = X.train().copy(), Y.train()
             X_train.insert(0,'ones', 1.0)
@@ -354,7 +354,7 @@ class equal_weight:
         # Declare backtest object to hold the test results
         portfolio = pc.backtest(len(Y.test())-Y.n_obs, self.n_y, Y.test().index[Y.n_obs:])
 
-        test_set = DataLoader(pc.SlidingWindow(X.test(), Y.test(), self.n_obs, 0))
+        test_set = DataLoader(pc.SlidingWindow(X.test(), Y.test(), self.n_obs, 1))
 
         # Test model
         t = 0
