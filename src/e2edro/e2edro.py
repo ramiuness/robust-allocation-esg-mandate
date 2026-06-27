@@ -797,10 +797,15 @@ class e2e_net(nn.Module):
                     X_temp.split_update(split)
                     Y_temp.split_update(split)
 
+                    # Re-fit feature standardization on this fold's train window, apply to its val window.
+                    mu = X_temp.train().mean()
+                    sigma = X_temp.train().std().replace(0.0, 1.0)
+                    Xtr, Xval = (X_temp.train() - mu) / sigma, (X_temp.test() - mu) / sigma
+
                     # Construct training and validation DataLoader objects
-                    train_set = DataLoader(pc.SlidingWindow(X_temp.train(), Y_temp.train(), 
+                    train_set = DataLoader(pc.SlidingWindow(Xtr, Y_temp.train(),
                                                             self.n_obs, self.perf_period))
-                    val_set = DataLoader(pc.SlidingWindow(X_temp.test(), Y_temp.test(), 
+                    val_set = DataLoader(pc.SlidingWindow(Xval, Y_temp.test(),
                                                             self.n_obs, self.perf_period))
 
                     # Reset learnable parameters gamma and delta
@@ -808,7 +813,7 @@ class e2e_net(nn.Module):
 
                     if self.pred_model == 'linear':
                         # Initialize the prediction layer weights to OLS regression weights
-                        X_train, Y_train = X_temp.train().copy(), Y_temp.train()
+                        X_train, Y_train = Xtr.copy(), Y_temp.train()
                         X_train.insert(0,'ones', 1.0)
 
                         X_train = Variable(torch.tensor(X_train.values, dtype=torch.double))
@@ -822,7 +827,7 @@ class e2e_net(nn.Module):
                             self.pred_layer.weight.copy_(Theta[:,1:])
 
                     if self.model_type == 'base_rom':
-                        self.update_sigma_mu_hat(X_temp.train())
+                        self.update_sigma_mu_hat(Xtr)
 
                     val_loss = self.net_train(train_set, val_set=val_set, lr=lr, epochs=epochs)
                     val_loss_tot.append(val_loss)
@@ -905,15 +910,20 @@ class e2e_net(nn.Module):
 
             X.split_update(split), Y.split_update(split)
 
-            train_set = DataLoader(pc.SlidingWindow(X.train(), Y.train(), self.n_obs, self.perf_period))
-            test_set = DataLoader(pc.SlidingWindow(X.test(), Y.test(), self.n_obs, 1))
+            # Re-fit feature standardization on this roll's train window, apply to its test window.
+            mu = X.train().mean()
+            sigma = X.train().std().replace(0.0, 1.0)
+            Xtr, Xte = (X.train() - mu) / sigma, (X.test() - mu) / sigma
+
+            train_set = DataLoader(pc.SlidingWindow(Xtr, Y.train(), self.n_obs, self.perf_period))
+            test_set = DataLoader(pc.SlidingWindow(Xte, Y.test(), self.n_obs, 1))
 
             # Reset learnable parameters gamma and delta
             self.load_state_dict(torch.load(self.init_state_path))
 
             if self.pred_model == 'linear':
                 # Initialize the prediction layer weights to OLS regression weights
-                X_train, Y_train = X.train().copy(), Y.train()
+                X_train, Y_train = Xtr.copy(), Y.train()
                 X_train.insert(0,'ones', 1.0)
 
                 device = self.pred_layer.weight.device
@@ -928,7 +938,7 @@ class e2e_net(nn.Module):
 
             # Update Sigma_mu_hat for base_rom using OLS-initialised B and current window's Cov(x)
             if self.model_type == 'base_rom':
-                diag_info = self.update_sigma_mu_hat(X.train())
+                diag_info = self.update_sigma_mu_hat(Xtr)
                 if diag_info.get('updated', False):
                     print(f"  Sigma_mu_hat updated (trace: {diag_info['sigma_mu_hat_trace']:.2e}, rank: {diag_info['rank']})")
 

@@ -234,9 +234,14 @@ class pred_then_opt(nn.Module):
 
             X.split_update(split), Y.split_update(split)
 
-            test_set = DataLoader(pc.SlidingWindow(X.test(), Y.test(), self.n_obs, 1))
+            # Re-fit feature standardization on this roll's train window, apply to its test window.
+            mu = X.train().mean()
+            sigma = X.train().std().replace(0.0, 1.0)
+            Xtr, Xte = (X.train() - mu) / sigma, (X.test() - mu) / sigma
 
-            X_train, Y_train = X.train().copy(), Y.train()
+            test_set = DataLoader(pc.SlidingWindow(Xte, Y.test(), self.n_obs, 1))
+
+            X_train, Y_train = Xtr.copy(), Y.train()
             X_train.insert(0,'ones', 1.0)
 
             X_train = Variable(torch.tensor(X_train.values, dtype=torch.double))
@@ -251,7 +256,7 @@ class pred_then_opt(nn.Module):
 
             # Update Sigma_mu_hat for base_rom using OLS-initialised B and current window's Cov(x)
             if self.model_type == 'base_rom':
-                diag_info = self.update_sigma_mu_hat(X.train())
+                diag_info = self.update_sigma_mu_hat(Xtr)
                 if diag_info.get('updated', False):
                     print(f"  Sigma_mu_hat updated (trace: {diag_info['sigma_mu_hat_trace']:.2e})")
 
