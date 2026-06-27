@@ -38,7 +38,7 @@ def set_seeds(seed=42):
 
 
 def load_data(start='2020-01-02', end='2025-12-31', n_y=20, n_obs=104,
-              split=(0.6, 0.4), freq='weekly', data_dir=None):
+              split=(0.6, 0.4), freq='weekly', data_dir=None, features=None):
     """Load features/returns from the repo's local CSVs (data_dir auto-resolved).
 
     start, end : ISO date bounds (clamped to data availability inside the loader).
@@ -47,13 +47,17 @@ def load_data(start='2020-01-02', end='2025-12-31', n_y=20, n_obs=104,
     split      : train/test ratio.
     freq       : 'weekly' or 'daily'.
     data_dir   : override; default <repo>/data.
+    features   : feature selection passed to fetch_data_from_disk. None/'all' ⇒
+                 all 12 features; else a str or list mixing group names
+                 ('ff5+mom', 'macro', 'esg') and/or individual column names.
     returns    : (X, Y) TrainTest objects from fetch_data_from_disk. Features are
                  RAW (bp-scale yields, decimal returns); standardization happens
                  later at each train-window boundary (date_window / calibrate_models).
     """
     data_dir = data_dir or _os.path.join(_REPO_ROOT, 'data')
     return dl.fetch_data_from_disk(start, end, split=list(split), freq=freq,
-                                   n_obs=n_obs, n_y=n_y, data_dir=data_dir)
+                                   n_obs=n_obs, n_y=n_y, features=features,
+                                   data_dir=data_dir)
 
 
 # Names re-exported by `from base_rom_demo_utils import *` (keeps the notebook
@@ -125,11 +129,17 @@ def running_dd(portfolio):
 # ---------------------------------------------------------------------------
 def plot_wealth(names, portfolios, title, figsize=(11, 5)):
     """Cumulative wealth curves for a list of (name, portfolio) pairs."""
-    dates = portfolios[0].rets.index
+    index = portfolios[0].rets.index
+    # Mirror the library's wealth_plot: prepend a baseline wealth=1.0 anchor one
+    # period before the first test date so curves start at 1.0 rather than 1+r0.
+    anchor_date = (index[0] - pd.Timedelta(days=7)
+                   if isinstance(index, pd.DatetimeIndex) else index[0] - 1)
+    dates = index.insert(0, anchor_date)
     fig, ax = plt.subplots(figsize=figsize)
     for name, port in zip(names, portfolios):
         color, ls = COLORS[name]
-        ax.plot(dates, port.rets['tri'].values,
+        tri = np.concatenate([[1.0], port.rets['tri'].values])
+        ax.plot(dates, tri,
                 color=color, linestyle=ls, linewidth=2, label=name)
     ax.set_xlabel('Date')
     ax.set_ylabel('Cumulative Wealth')
@@ -199,12 +209,17 @@ def _dash(ls):
 
 def plot_all_wealth(all_names, all_ports):
     """Interactive cumulative wealth chart (Plotly). Legend placed outside right."""
-    dates = [d.strftime('%Y-%m-%d') for d in all_ports[0].rets.index]
+    index = all_ports[0].rets.index
+    # Mirror the library's wealth_plot: prepend a baseline wealth=1.0 anchor one
+    # period before the first test date so curves start at 1.0 rather than 1+r0.
+    anchor_date = (index[0] - pd.Timedelta(days=7)
+                   if isinstance(index, pd.DatetimeIndex) else index[0] - 1)
+    dates = [d.strftime('%Y-%m-%d') for d in index.insert(0, anchor_date)]
     fig = go.Figure()
     for name, port in zip(all_names, all_ports):
         color, ls = COLORS[name]
         fig.add_trace(go.Scatter(
-            x=dates, y=port.rets['tri'].values.tolist(),
+            x=dates, y=[1.0, *port.rets['tri'].values.tolist()],
             mode='lines', name=name,
             line=dict(color=color, dash=_dash(ls), width=2.5 if 'ROM' in name else 1.8)
         ))

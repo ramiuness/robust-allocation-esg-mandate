@@ -558,8 +558,71 @@ def fetch_market_data(start:str, end:str, split:list, freq:str='weekly', n_obs:i
 ####################################################################################################
 # Fetch market data from local CSV files (no network required)
 ####################################################################################################
+
+# Canonical 12-feature panel (ordering is the source of truth for column order).
+DISK_FEATURE_COLS = ['MKT', 'SMB', 'HML', 'RMW', 'CMA', 'MOM',
+                     'DGS10', 'T5YIFR', 'DCOILWTICO', 'DHHNGSP', 'VIXCLS', 'esg']
+
+# Named shortcuts that expand to groups of the canonical features.
+FEATURE_GROUPS = {
+    'ff5+mom': ['MKT', 'SMB', 'HML', 'RMW', 'CMA', 'MOM'],
+    'macro':   ['DGS10', 'T5YIFR', 'DCOILWTICO', 'DHHNGSP', 'VIXCLS'],
+    'esg':     ['esg'],
+}
+
+
+def _resolve_features(features, final_cols=DISK_FEATURE_COLS):
+    """Resolve a feature selection into an ordered, de-duplicated column list.
+
+    Parameters
+    ----------
+    features : None, str, or list of str
+        ``None`` or ``'all'`` selects every canonical feature. Otherwise a string
+        or list of strings, where each token is either a group name (see
+        ``FEATURE_GROUPS``) or an individual canonical column name. Groups and
+        individual names may be mixed freely.
+    final_cols : list of str
+        Canonical ordered feature list. Resolved columns are returned in this
+        order regardless of the order they were requested in.
+
+    Returns
+    -------
+    list of str
+        Selected columns, in canonical order, de-duplicated.
+
+    Raises
+    ------
+    ValueError
+        If any token is neither a known group nor a known column name.
+    """
+    if features is None or features == 'all':
+        return list(final_cols)
+
+    tokens = [features] if isinstance(features, str) else list(features)
+
+    resolved, unknown = [], []
+    for tok in tokens:
+        if tok in FEATURE_GROUPS:
+            resolved.extend(FEATURE_GROUPS[tok])
+        elif tok in final_cols:
+            resolved.append(tok)
+        else:
+            unknown.append(tok)
+
+    if unknown:
+        raise ValueError(
+            f"Unknown feature token(s): {unknown}. "
+            f"Valid groups: {sorted(FEATURE_GROUPS)}; "
+            f"valid columns: {final_cols}."
+        )
+
+    # Return in canonical order, de-duplicated.
+    selected = set(resolved)
+    return [c for c in final_cols if c in selected]
+
+
 def fetch_data_from_disk(start: str, end: str, split: list, freq: str = 'weekly', n_obs: int = 104,
-                         n_y: int = None, data_dir: str = './data',
+                         n_y: int = None, features=None, data_dir: str = './data',
                          use_cache: bool = False, save_results: bool = False):
     """Load market and factor data from local CSV files.
 
@@ -589,6 +652,19 @@ def fetch_data_from_disk(start: str, end: str, split: list, freq: str = 'weekly'
     n_y : int, optional
         Number of assets to select (alphabetical). If None, all clean
         tickers are used. The default is None.
+    features : None, str, or list of str, optional
+        Which features to include in X. ``None`` (default) or ``'all'`` returns
+        all 12 canonical features. Otherwise a string or list mixing group names
+        and/or individual column names:
+            groups  — 'ff5+mom' (MKT, SMB, HML, RMW, CMA, MOM),
+                      'macro' (DGS10, T5YIFR, DCOILWTICO, DHHNGSP, VIXCLS),
+                      'esg' (esg)
+            columns — any of the 12 canonical names, e.g. 'HML', 'VIXCLS'
+        To drop a single FF factor, list the ones you want by name rather than
+        using the 'ff5+mom' group. Selected columns are always returned in the
+        canonical order regardless of request order, and duplicates are removed.
+        The cache (use_cache / save_results) always stores the full 12-feature
+        panel; subsetting is applied after loading, so any subset is cache-safe.
     data_dir : str, optional
         Directory containing the data CSVs. The default is './data'.
     use_cache : bool, optional
@@ -616,8 +692,7 @@ def fetch_data_from_disk(start: str, end: str, split: list, freq: str = 'weekly'
     else:
         ff_names    = ['MKT-RF', 'SMB', 'HML', 'RMW', 'CMA', 'MOM']
         macro_names = ['DGS10', 'T5YIFR', 'DCOILWTICO', 'DHHNGSP', 'VIXCLS']
-        final_cols  = ['MKT', 'SMB', 'HML', 'RMW', 'CMA', 'MOM',
-                       'DGS10', 'T5YIFR', 'DCOILWTICO', 'DHHNGSP', 'VIXCLS', 'esg']
+        final_cols  = DISK_FEATURE_COLS
 
         # -- Y: asset returns -------------------------------------------------
         sp = pd.read_csv(data_dir + '/sp_meta.csv', index_col=0, parse_dates=['Date'])
@@ -673,6 +748,9 @@ def fetch_data_from_disk(start: str, end: str, split: list, freq: str = 'weekly'
         if save_results:
             X.to_pickle('./cache/disk_factor_' + freq + '.pkl')
             Y.to_pickle('./cache/disk_asset_' + freq + '.pkl')
+
+    # Subset features after build/cache so any selection is cache-safe.
+    X = X[_resolve_features(features)]
 
     # X[t] predicts Y[t+1] — lag by one observation to avoid look-ahead bias
     return TrainTest(X[:-1], n_obs, split), TrainTest(Y[1:], n_obs, split)
