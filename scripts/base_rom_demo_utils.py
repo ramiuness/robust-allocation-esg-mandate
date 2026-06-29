@@ -1,16 +1,23 @@
 """
-Utilities for base_rom_demo.ipynb.
-Metric computation, running drawdown, and all plot functions (interactive Plotly).
-The _px names are kept as backward-compat aliases for the other notebooks that
-import them (see the bottom of the plot section).
+Shared experiment + plotting harness for the ilo-portfolio-allocation notebooks
+(base_rom_demo, esg_experiment_*, esg_alloc_*, e2e_ro_vs_dro_*, esg_diagnostic).
 
-Experiment helpers (build_models, calibrate_models, fit_window, infer_window,
-date_window, run_window, trained_params, model_report) abstract the model-zoo
-instantiation and the decoupled fit/inference flow out of the notebook cells.
+Contents
+- Data loading (load_data) and metrics (portfolio_metrics, build_metrics_table,
+  running_dd).
+- Two plot families: matplotlib (plot_wealth, plot_epsilon_trajectory,
+  plot_weight_heatmap) and Plotly (plot_all_wealth, plot_drawdown,
+  plot_summary_bars). The `_px` names are backward-compat aliases for the Plotly
+  plotters: esg_alloc_1..4 import them as `plot_all_wealth_px as plot_all_wealth`.
+- Experiment helpers (build_models, calibrate_models, fit_window, infer_window,
+  date_window, run_window, trained_params, model_report) that abstract model-zoo
+  instantiation and the decoupled fit/inference flow out of the notebook cells.
 
-Notebook prelude: a single `from base_rom_demo_utils import *` pulls in np, pd,
-torch, the data loader (load_data) and every helper, so setup cells stay short.
+Import patterns in use: `from base_rom_demo_utils import *` (pulls in np, pd,
+torch, dl + every helper, keeping setup cells short), explicit
+`from base_rom_demo_utils import (...)`, and the `_px`-aliased explicit import.
 """
+import copy as _copy
 import os as _os
 
 import numpy as np
@@ -62,10 +69,12 @@ def load_data(start='2020-01-02', end='2025-12-31', n_y=20, n_obs=104,
 
 # Names re-exported by `from base_rom_demo_utils import *` (keeps the notebook
 # namespace clean while still giving it np/pd/torch/dl + every helper).
+# portfolio_metrics / running_dd are intentionally omitted: they are internal
+# helpers behind build_metrics_table / plot_drawdown and no notebook imports them.
 __all__ = [
     'np', 'pd', 'torch', 'dl', 'COLORS',
     'set_seeds', 'load_data',
-    'portfolio_metrics', 'build_metrics_table', 'running_dd',
+    'build_metrics_table',
     'plot_wealth', 'plot_epsilon_trajectory', 'plot_weight_heatmap',
     'plot_all_wealth', 'plot_drawdown', 'plot_summary_bars',
     'build_models', 'calibrate_models', 'fit_window', 'infer_window',
@@ -127,14 +136,20 @@ def running_dd(portfolio):
 # ---------------------------------------------------------------------------
 # Plot functions
 # ---------------------------------------------------------------------------
+def _wealth_anchor(index):
+    """Prepend a baseline wealth=1.0 anchor one period before the first test date.
+
+    Mirrors the library's wealth_plot so curves start at 1.0 rather than 1+r0.
+    Returns `index` with one extra leading timestamp (or integer) at the front.
+    """
+    anchor = (index[0] - pd.Timedelta(days=7)
+              if isinstance(index, pd.DatetimeIndex) else index[0] - 1)
+    return index.insert(0, anchor)
+
+
 def plot_wealth(names, portfolios, title, figsize=(11, 5)):
     """Cumulative wealth curves for a list of (name, portfolio) pairs."""
-    index = portfolios[0].rets.index
-    # Mirror the library's wealth_plot: prepend a baseline wealth=1.0 anchor one
-    # period before the first test date so curves start at 1.0 rather than 1+r0.
-    anchor_date = (index[0] - pd.Timedelta(days=7)
-                   if isinstance(index, pd.DatetimeIndex) else index[0] - 1)
-    dates = index.insert(0, anchor_date)
+    dates = _wealth_anchor(portfolios[0].rets.index)
     fig, ax = plt.subplots(figsize=figsize)
     for name, port in zip(names, portfolios):
         color, ls = COLORS[name]
@@ -209,12 +224,7 @@ def _dash(ls):
 
 def plot_all_wealth(all_names, all_ports):
     """Interactive cumulative wealth chart (Plotly). Legend placed outside right."""
-    index = all_ports[0].rets.index
-    # Mirror the library's wealth_plot: prepend a baseline wealth=1.0 anchor one
-    # period before the first test date so curves start at 1.0 rather than 1+r0.
-    anchor_date = (index[0] - pd.Timedelta(days=7)
-                   if isinstance(index, pd.DatetimeIndex) else index[0] - 1)
-    dates = [d.strftime('%Y-%m-%d') for d in index.insert(0, anchor_date)]
+    dates = [d.strftime('%Y-%m-%d') for d in _wealth_anchor(all_ports[0].rets.index)]
     fig = go.Figure()
     for name, port in zip(all_names, all_ports):
         color, ls = COLORS[name]
@@ -310,13 +320,13 @@ _SPO_SPECS = [
 def build_models(cfg, n_x, n_y, n_obs, which=None):
     """Instantiate the model zoo and bind cfg to each model.
 
-    cfg    : dict of hyperparameters (seed, epochs, lr, weight_decay, gamma_lr,
-             max_weight, long_short, target_ratio, ...). Stashed as model.cfg.
-    n_x    : number of features.
-    n_y    : number of assets.
-    n_obs  : rolling-window size.
-    which  : optional iterable of model names to keep (default: all eight).
-    returns: dict {name: model} with cfg attached to every model.
+    cfg     : dict of hyperparameters (seed, epochs, lr, weight_decay, gamma_lr,
+              max_weight, long_short, target_ratio, ...). Stashed as model.cfg.
+    n_x     : number of features.
+    n_y     : number of assets.
+    n_obs   : rolling-window size.
+    which   : optional iterable of model names to keep (default: all eight).
+    returns : dict {name: model} with cfg attached to every model.
     """
     ew = bm.equal_weight(n_x=n_x, n_y=n_y, n_obs=n_obs)
     po_m = bm.pred_then_opt(n_x, n_y, n_obs, opt_layer='base_mod',
@@ -335,10 +345,16 @@ def build_models(cfg, n_x, n_y, n_obs, which=None):
         kw = dict(spec)
         if kw['opt_layer'] in ('nominal', 'tv', 'hellinger'):
             kw['gamma_lr'] = cfg['gamma_lr']
-        models[name] = e2e_net(**shared, **kw).double()
+        m = e2e_net(**shared, **kw).double()
+        # In-memory pristine snapshot used by fit_window's reset. Per-object, so
+        # SPO-TV and SPO-Hellinger (both model_type='dro') no longer alias the
+        # library's shared on-disk init_state file.
+        m._init_state = _copy.deepcopy(m.state_dict())
+        models[name] = m
 
-    for m in models.values():
+    for name, m in models.items():
         m.cfg = cfg
+        m._name = name          # labels trained_params / model_report rows
     if which is not None:
         models = {k: models[k] for k in which}
     return models
@@ -346,6 +362,13 @@ def build_models(cfg, n_x, n_y, n_obs, which=None):
 
 def calibrate_models(models, X_train, Y_train, target_ratio=None):
     """One-time calibration of pred_loss_factor for every SPO (e2e_net) model.
+
+    pred_loss_factor must be calibrated *at the OLS initialization* (see CLAUDE.md
+    and e2e_net.calibrate_pred_loss_factor), so each model is OLS warm-started here
+    — with the same _ols_init / update_sigma_mu_hat that fit_window applies — before
+    the calibration forward pass. The OLS init is deterministic in (X_train, Y_train),
+    so the later fit_window(reset=True) re-derives the identical weights; pred_loss_factor
+    is a plain attribute and survives that reset.
 
     models       : dict {name: model} from build_models.
     X_train      : standardized train-slice feature DataFrame from date_window
@@ -359,6 +382,9 @@ def calibrate_models(models, X_train, Y_train, target_ratio=None):
     for name, m in models.items():
         if isinstance(m, e2e_net) and m.pred_loss is not None:
             tr = target_ratio if target_ratio is not None else m.cfg.get('target_ratio', 0.5)
+            _ols_init(m, X_train, Y_train)
+            if m.model_type == 'base_rom':
+                m.update_sigma_mu_hat(X_train)
             out[name] = m.calibrate_pred_loss_factor(X_train, Y_train, tr)
     return out
 
@@ -423,8 +449,10 @@ def fit_window(model, X_train_df, Y_train_df, *, reset=True):
     model       : equal_weight | pred_then_opt | e2e_net.
     X_train_df  : training-window feature DataFrame.
     Y_train_df  : training-window return DataFrame, aligned with X_train_df.
-    reset       : if True, restore e2e_net learnable params from init_state_path
-                  before training (ignored for the other model types).
+    reset       : if True, restore e2e_net learnable params from the in-memory
+                  pristine snapshot (model._init_state, taken in build_models)
+                  before training (ignored for the other model types). Matters
+                  only when the same model object is refit across windows.
     returns     : the (fitted) model, with introspection attributes attached.
     """
     if isinstance(model, bm.equal_weight):
@@ -438,8 +466,8 @@ def fit_window(model, X_train_df, Y_train_df, *, reset=True):
         return model
 
     # e2e_net
-    if reset and hasattr(model, 'init_state_path'):
-        model.load_state_dict(torch.load(model.init_state_path))
+    if reset and hasattr(model, '_init_state'):
+        model.load_state_dict(model._init_state)
     Theta = _ols_init(model, X_train_df, Y_train_df)
     if model.model_type == 'base_rom':
         model.update_sigma_mu_hat(X_train_df)
