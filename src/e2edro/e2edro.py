@@ -4,7 +4,12 @@
 ## Import libraries
 ####################################################################################################
 import os
+import copy
+import io
+import contextlib
+import warnings
 import numpy as np
+import pandas as pd
 import cvxpy as cp
 from cvxpylayers.torch import CvxpyLayer
 import torch
@@ -327,6 +332,79 @@ def base_rom(n_y, n_obs, prisk, sigma_mu_hat, max_weight=1.0, long_short=False):
     return CvxpyLayer(problem, parameters=[y_hat, epsilon], variables=[z])
 
 ####################################################################################################
+# Solver configuration + robust solve  (owned by the library; no monkeypatching)
+####################################################################################################
+def default_solver_args(model_type):
+    """Per-model_type ECOS settings reaching each problem's numerical floor, with the '*_inacc'
+    band collapsed onto the strict tolerance so an unreachable solve RAISES ('optimal inaccurate'
+    is otherwise silently accepted). Overridable via the solver_args constructor argument.
+    (base_mod LP -> 1e-10; base_rom SOCP -> 1e-9; DRO cones -> 1e-8; see spo-critical-review.md II.)
+    """
+    tol = {'base_mod': 1e-10, 'base_rom': 1e-9}.get(model_type, 1e-8)
+    max_iters = 10000 if model_type in ('base_mod', 'base_rom') else 20000
+    return {'solve_method': 'ECOS', 'max_iters': max_iters, 'verbose': False,
+            'abstol': tol, 'reltol': tol, 'feastol': tol,
+            'abstol_inacc': tol, 'reltol_inacc': tol, 'feastol_inacc': tol}
+
+
+@contextlib.contextmanager
+def _quiet_solver():
+    """Silence the cone solver's own stdout/stderr/warnings, scoped to a single solve call so it
+    never masks warnings raised elsewhere (e.g. torch's deterministic-algorithms warning)."""
+    with warnings.catch_warnings(), \
+            contextlib.redirect_stdout(io.StringIO()), \
+            contextlib.redirect_stderr(io.StringIO()):
+        warnings.simplefilter('ignore')
+        yield
+
+
+def robust_solve(model, *params):
+    """Solve model.opt_layer at model.solver_args; on failure retry at model.solve_retry_args
+    (if set), then fall back to equal weight if model.solve_fallback, else re-raise. Retry/fallback
+    events are recorded in model._solve_log as (model._solve_phase, 'retry'/'fallback').
+
+    This is the owned replacement for the harness's former CvxpyLayer.forward monkeypatch: the
+    solve strategy is model state, configured via the constructor, not a runtime patch of a
+    third-party class. Returns the layer's output tuple (z,).
+    """
+    try:
+        with _quiet_solver():
+            return model.opt_layer(*params, solver_args=model.solver_args)
+    except Exception:
+        if model.solve_retry_args is not None:
+            try:
+                with _quiet_solver():
+                    out = model.opt_layer(*params, solver_args=model.solve_retry_args)
+                model._solve_log.append((model._solve_phase, 'retry'))
+                return out
+            except Exception:
+                pass
+        if model.solve_fallback:
+            model._solve_log.append((model._solve_phase, 'fallback'))
+            z = torch.full((model.n_y, 1), 1.0 / model.n_y, dtype=torch.double,
+                           device=model.pred_layer.weight.device, requires_grad=True)
+            return (z,)
+        raise
+
+
+####################################################################################################
+# Shared OLS warm-start
+####################################################################################################
+def ols_theta(X_df, Y_df):
+    """OLS with intercept. Returns Theta (n_y x [1+n_x]) = [bias | weights] as a double tensor.
+
+    Single source of truth for the OLS warm-start that was previously duplicated across net_cv,
+    net_roll_test, BaseModels.pred_then_opt and gamma_range, and the harness. 'ones' is the FIRST
+    column so Theta[:, 0] is the bias; solved with torch.linalg.lstsq in double.
+    """
+    Xt = X_df.copy()
+    Xt.insert(0, 'ones', 1.0)
+    X = torch.tensor(Xt.values, dtype=torch.double)
+    Y = torch.tensor(Y_df.values, dtype=torch.double)
+    return torch.linalg.lstsq(X, Y).solution.T
+
+
+####################################################################################################
 # E2E neural network module
 ####################################################################################################
 class DeviceDataLoader:
@@ -348,7 +426,7 @@ class e2e_net(nn.Module):
     """End-to-end DRO learning neural net module.
     """
     def __init__(self, n_x, n_y, n_obs, opt_layer='nominal', prisk='p_var', perf_loss='sharpe_loss',
-                pred_model='linear', pred_loss_factor=0.5, perf_period=13, train_pred=True, train_gamma=True, train_delta=True, train_epsilon=True, set_seed=None, epochs=10, lr=1e-3, epsilon_lr=None, weight_decay=0.0, gamma_lr=None, long_short=False, cache_path='./cache/', max_weight=None):
+                pred_model='linear', pred_loss_factor=0.5, perf_period=13, train_pred=True, train_gamma=True, train_delta=True, train_epsilon=True, set_seed=42, epochs=10, lr=1e-3, epsilon_lr=None, weight_decay=0.0, gamma_lr=None, long_short=False, cache_path='./cache/', max_weight=1.0, solver_args=None, solve_retry_args=None, solve_fallback=False):
         """End-to-end learning neural net module
 
         This NN module implements a linear prediction layer 'pred_layer' and a DRO layer 
@@ -375,17 +453,28 @@ class e2e_net(nn.Module):
         e2e_net: nn.Module object 
         """
         super(e2e_net, self).__init__()
-        self.double()
 
-        # Set random seed (to be used for replicability of numerical experiments)
+        # Local RNG for parameter init. Draw gamma/delta/epsilon from a private Generator so the
+        # draw depends only on this model's seed -- not on global RNG state or construction order
+        # -- and never perturbs the global stream. (pred_layer's random init is intentionally
+        # left to the global default: it is always OLS-overwritten before use.)
+        self.seed = set_seed
+        gen = torch.Generator()
         if set_seed is not None:
-            torch.manual_seed(set_seed)
-            self.seed = set_seed
+            gen.manual_seed(set_seed)
 
         self.n_x = n_x
         self.n_y = n_y
         self.n_obs = n_obs
         self.max_weight = max_weight  # Max weight per asset for diversification
+
+        # Feasibility: an active per-asset cap must admit a feasible budget (sum(z)==1).
+        # Checked here for every opt_layer (previously only base_rom validated it).
+        if max_weight < 1.0 and max_weight * n_y < 1.0:
+            raise ValueError(
+                f"Infeasible: max_weight={max_weight} with n_y={n_y} assets. "
+                f"Need max_weight >= {1.0/n_y:.4f} (= 1/n_y) for feasibility."
+            )
         self.epochs = epochs  #it seems that i have to add it there is a call to self.epochs in train_net()
         self.lr = lr  #it seems that i have to add it there is a call to self.lr in train_net()
         self.epsilon_lr = epsilon_lr  # Separate learning rate for epsilon (if None, uses lr)
@@ -409,7 +498,7 @@ class e2e_net(nn.Module):
         self.perf_period = perf_period
 
         # Register 'gamma' (modeling risk-return trade-off parameter)
-        self.gamma = nn.Parameter(torch.FloatTensor(1).uniform_(0.02, 0.1))
+        self.gamma = nn.Parameter(torch.empty(1).uniform_(0.02, 0.1, generator=gen))
         self.gamma.requires_grad = train_gamma
         self.gamma_init = self.gamma.item()
 
@@ -426,7 +515,7 @@ class e2e_net(nn.Module):
                     "Sigma_mu_hat = B Cov(x) B^T is only defined for a single factor-loading matrix B."
                 )
             self.gamma.requires_grad = False
-            self.epsilon = nn.Parameter(torch.FloatTensor(1).uniform_(0.1, 1.0))
+            self.epsilon = nn.Parameter(torch.empty(1).uniform_(0.1, 1.0, generator=gen))
             self.epsilon.requires_grad = train_epsilon
             self.epsilon_init = self.epsilon.item()
             self.model_type = 'base_rom'
@@ -438,7 +527,7 @@ class e2e_net(nn.Module):
             else:
                 ub = (1 - 1/n_obs) / 2
                 lb = (1 - 1/n_obs) / 10
-            self.delta = nn.Parameter(torch.FloatTensor(1).uniform_(lb, ub))
+            self.delta = nn.Parameter(torch.empty(1).uniform_(lb, ub, generator=gen))
             self.delta.requires_grad = train_delta
             self.delta_init = self.delta.item()
             self.model_type = 'dro'
@@ -467,52 +556,42 @@ class e2e_net(nn.Module):
                       nn.ReLU(),
                       nn.Linear(n_y, n_y))
 
-        # LAYER: Optimization model
+        # LAYER: Optimization model. base_rom's Sigma_mu_hat = B Cov(x) B^T needs data (Cov(x))
+        # and the OLS-fitted B, neither available at construction -- so its opt_layer is built
+        # lazily by fit_predictor() and stays None until then (forward() raises if used unfitted).
+        # No identity placeholder: there is no correct placeholder value, so we forbid use instead.
         if opt_layer == 'base_rom':
-            placeholder = np.eye(n_y)
-            self.sigma_mu_hat = placeholder
-            self._cov_x_cache = None  # populated by update_sigma_mu_hat before net_train
-            self.opt_layer = base_rom(n_y, n_obs, eval('rf.'+prisk), placeholder,
-                                      max_weight=max_weight, long_short=long_short)
+            self.sigma_mu_hat = None
+            self._cov_x_cache = None
+            self.opt_layer = None
         else:
-            self.opt_layer = eval(opt_layer)(n_y, n_obs, eval('rf.'+prisk),
+            self.opt_layer = eval(opt_layer)(n_y, n_obs, self.prisk_func,
                                              max_weight=max_weight, long_short=long_short)
         # Store reference path to store model data
         self.cache_path = cache_path
 
-        # Store initial model. During every rolling-window, back-test, or cross-validation fold, the code needs to reset the network to a clean "initial" state before retraining on the new window.
-        _hw = f'_mw{max_weight}_ls{long_short}'
-        if self.model_type == 'base_mod':
-            self.init_state_path = (cache_path + self.model_type
-                                    + '_initial_state_' + pred_model + _hw)
-        elif self.model_type == 'base_rom':
-            self.init_state_path = (cache_path + self.model_type
-                                    + '_initial_state_' + pred_model
-                                    + '_TrainEpsilon' + str(train_epsilon) + _hw)
-        elif train_gamma and train_delta:
-            self.init_state_path = (cache_path + self.model_type
-                                    + '_initial_state_' + pred_model + _hw)
-        elif train_delta and not train_gamma:
-            self.init_state_path = (cache_path + self.model_type
-                                    + '_initial_state_' + pred_model
-                                    + '_TrainDelta' + str(train_delta) + _hw)
-        elif train_gamma and not train_delta:
-            self.init_state_path = (cache_path + self.model_type
-                                    + '_initial_state_' + pred_model
-                                    + '_TrainGamma' + str(train_gamma) + _hw)
-        elif not train_gamma and not train_delta:
-            self.init_state_path = (cache_path + self.model_type
-                                    + '_initial_state_' + pred_model
-                                    + '_TrainGamma' + str(train_gamma)
-                                    + '_TrainDelta' + str(train_delta) + _hw)
-        # Store a checkpoint of the just-initialised weights. Restores the pristine state before each new roll (such as in net_roll_test
-  # Make sure this is imported at the top
+        # Solver strategy (owned; no monkeypatch). solver_args defaults per model_type with the
+        # '*_inacc' band collapsed so an inaccurate solve raises. Optional retry/equal-weight
+        # fallback are off by default (fail-loud); the experiment harness turns them on.
+        self.solver_args = solver_args if solver_args is not None else default_solver_args(self.model_type)
+        self.solve_retry_args = solve_retry_args
+        self.solve_fallback = solve_fallback
+        self._solve_log = []       # accumulates (phase, 'retry'/'fallback') across windows
+        self._solve_phase = None   # set by the caller (calibrate/train/infer) before solving
 
-        # Ensure parent directory exists
-        os.makedirs(os.path.dirname(self.init_state_path), exist_ok=True)
+        # Cast all parameters/submodules to double. MUST be after every parameter and
+        # submodule exists (gamma/delta/epsilon, pred_layer, opt_layer); calling it at the
+        # top of __init__ would be a no-op while SlidingWindow always emits float64.
+        self.double()
 
-        
-        torch.save(self.state_dict(), self.init_state_path)
+        # In-memory pristine snapshot of the just-initialised learnable state. Each roll / CV fold
+        # resets from this (see net_roll_test / net_cv). Held per-object, so two same-config models
+        # (e.g. tv and hellinger, both model_type='dro') can never clobber each other's init -- the
+        # previous model_type-keyed on-disk checkpoint did, silently loading the wrong delta. The
+        # opt_layer (CvxpyLayer) contributes no state_dict keys, so this is unaffected by base_rom's
+        # placeholder/rebuild.
+        self.opt_layer_name = opt_layer
+        self._init_state = copy.deepcopy(self.state_dict())
 
     #-----------------------------------------------------------------------------------------------
     # calibrate_pred_loss_factor: balance loss scales at OLS initialization
@@ -573,20 +652,21 @@ class e2e_net(nn.Module):
             ep = Y - Y_hat[:-1]
             y_hat = Y_hat[-1]
 
-        # Optimization solver arguments (from CVXPY for ECOS/SCS solver)
-        solver_args = {'solve_method': 'ECOS', 'max_iters': 250, 'abstol': 1e-7}
-        #solver_args = {'solve_method': 'SCS', 'eps': 1e-7, 'acceleration_lookback': 5, 'max_iters':20000}
-
-        # Optimize z per scenario
-        # Determine whether nominal or dro model
+        # Optimize z per scenario via the owned robust-solve strategy (self.solver_args, with
+        # optional retry/fallback). Determine whether nominal, dro, base_mod or base_rom model.
         if self.model_type == 'nom':
-            z_star, = self.opt_layer(ep, y_hat, self.gamma, solver_args=solver_args)
+            z_star, = robust_solve(self, ep, y_hat, self.gamma)
         elif self.model_type == 'dro':
-            z_star, = self.opt_layer(ep, y_hat, self.gamma, self.delta, solver_args=solver_args)
+            z_star, = robust_solve(self, ep, y_hat, self.gamma, self.delta)
         elif self.model_type == 'base_mod':
-            z_star, = self.opt_layer(y_hat, solver_args=solver_args)
+            z_star, = robust_solve(self, y_hat)
         elif self.model_type == 'base_rom':
-            z_star, = self.opt_layer(y_hat, self.epsilon, solver_args=solver_args)
+            if self.opt_layer is None:
+                raise RuntimeError(
+                    "base_rom model is not fitted: call fit_predictor(X_train, Y_train) to build "
+                    "Sigma_mu_hat = B Cov(x) B^T before forward()/net_train()."
+                )
+            z_star, = robust_solve(self, y_hat, self.epsilon)
 
         return z_star, y_hat
 
@@ -618,6 +698,13 @@ class e2e_net(nn.Module):
         # I needed to add the GPU MOD: move model to GPU if available. Better if revised for the possibility of moving to GPU all at once.
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.to(device)
+
+        # base_rom must be fitted first: Sigma_mu_hat needs Cov(x) + the OLS-fitted B. Fail loud
+        # rather than silently training epsilon against a stale/absent geometry.
+        if self.model_type == 'base_rom' and self._cov_x_cache is None:
+            raise RuntimeError(
+                "base_rom is not fitted: call fit_predictor(X_train, Y_train) before net_train()."
+            )
 
         # Build parameter groups: weight_decay on prediction weights only, zero on portfolio params
         port_param_names = {'gamma', 'delta', 'epsilon'}
@@ -674,15 +761,11 @@ class e2e_net(nn.Module):
                 if name == 'epsilon':
                     param.data.clamp_(0.0001)
 
-            # Per-epoch rebuild of the base_rom layer with updated B
-            if self.model_type == 'base_rom' and self._cov_x_cache is not None:
-                B_np = self.pred_layer.weight.detach().cpu().numpy()
-                sigma_mu_hat_new = B_np @ self._cov_x_cache @ B_np.T
-                self.sigma_mu_hat = sigma_mu_hat_new
-                self.opt_layer = base_rom(
-                    self.n_y, self.n_obs, self.prisk_func,
-                    sigma_mu_hat_new, self.max_weight, long_short=self.long_short
-                )
+            # Per-epoch rebuild of the base_rom layer with the updated B -- only when B is actually
+            # learning (train_pred=True). When B is frozen the layer built at fit_predictor() is
+            # already correct, so rebuilding every epoch would be byte-identical wasted work.
+            if self.model_type == 'base_rom' and self.pred_layer.weight.requires_grad:
+                self._rebuild_opt_layer()
 
         # Compute and return the validation loss of the model
         if val_set is not None:
@@ -711,56 +794,43 @@ class e2e_net(nn.Module):
             return val_loss
 
     #-----------------------------------------------------------------------------------------------
-    # update_sigma_mu_hat: Update estimator covariance and rebuild base_rom layer
+    # fit_predictor / _rebuild_opt_layer: OLS warm-start and (base_rom) estimator-covariance build
     #-----------------------------------------------------------------------------------------------
-    def update_sigma_mu_hat(self, X_train):
-        """Recompute Sigma_mu_hat = B Cov(x) B^T and rebuild the base_rom optimization layer.
+    def _rebuild_opt_layer(self):
+        """(Re)build base_rom's SOCP layer from the current B and the cached Cov(x).
 
-        Cov(x) is cached as self._cov_x_cache so net_train() can rebuild cheaply each epoch
-        without re-reading X_train. Must be called after OLS initialisation of pred_layer.
-        Only meaningful for pred_model='linear' (enforced at construction via ValueError).
-
-        Parameters
-        ----------
-        X_train : pd.DataFrame or torch.Tensor
-            Factor data for the current training window (without a ones column).
-
-        Returns
-        -------
-        dict
-            Diagnostic information (updated, sigma_mu_hat_trace, rank).
+        One place for both the initial build (fit_predictor) and the per-epoch rebuild (net_train),
+        so the estimation-robust geometry is always Sigma_mu_hat = B Cov(x) B^T for the live B.
         """
-        import pandas as pd
-
-        diagnostics = {}
-        if self.model_type != 'base_rom':
-            diagnostics['updated'] = False
-            diagnostics['reason'] = f'Model type is {self.model_type}, not base_rom'
-            return diagnostics
-
-        B = self.pred_layer.weight.detach().cpu().numpy()   # (n_y, n_x)
-
-        if isinstance(X_train, pd.DataFrame):
-            cov_x = X_train.cov().values                   # (n_x, n_x)
-        else:
-            cov_x = torch.cov(X_train.T).cpu().numpy()
-
-        self._cov_x_cache = cov_x                          # cached for per-epoch rebuilds
-        sigma_mu_hat_new  = B @ cov_x @ B.T                # (n_y, n_y)
-        self.sigma_mu_hat = sigma_mu_hat_new
-
+        B = self.pred_layer.weight.detach().cpu().numpy()          # (n_y, n_x)
+        self.sigma_mu_hat = B @ self._cov_x_cache @ B.T            # (n_y, n_y)
         self.opt_layer = base_rom(
             self.n_y, self.n_obs, self.prisk_func,
-            sigma_mu_hat_new, self.max_weight, long_short=self.long_short
+            self.sigma_mu_hat, self.max_weight, long_short=self.long_short
         )
 
-        eigvals = np.linalg.eigvalsh(sigma_mu_hat_new)
-        rank = int(np.sum(eigvals > 1e-10 * eigvals[-1]))
+    def fit_predictor(self, X_train, Y_train):
+        """OLS-warm-start the prediction layer from one training window; for base_rom also cache
+        Cov(x) and (re)build the estimation-robust opt_layer. Single entry point replacing the old
+        external 'OLS init + update_sigma_mu_hat' pair (which forced a public method + placeholder).
 
-        diagnostics['updated'] = True
-        diagnostics['sigma_mu_hat_trace'] = float(np.trace(sigma_mu_hat_new))
-        diagnostics['rank'] = rank
-        return diagnostics
+        X_train : feature DataFrame (standardized, no ones column) or tensor.
+        Y_train : return DataFrame/tensor, positionally aligned with X_train.
+        Returns Theta (n_y x [1+n_x]) on the pred_layer's device.
+        """
+        Theta = ols_theta(X_train, Y_train)
+        device = self.pred_layer.weight.device
+        Theta = Theta.to(device)
+        with torch.no_grad():
+            self.pred_layer.bias.copy_(Theta[:, 0])
+            self.pred_layer.weight.copy_(Theta[:, 1:])
+        if self.model_type == 'base_rom':
+            if isinstance(X_train, pd.DataFrame):
+                self._cov_x_cache = X_train.cov().values
+            else:
+                self._cov_x_cache = torch.cov(X_train.T).cpu().numpy()
+            self._rebuild_opt_layer()
+        return Theta
 
     #-----------------------------------------------------------------------------------------------
     # net_cv: Cross validation of the e2e neural net for hyperparameter tuning
@@ -809,25 +879,11 @@ class e2e_net(nn.Module):
                                                             self.n_obs, self.perf_period))
 
                     # Reset learnable parameters gamma and delta
-                    self.load_state_dict(torch.load(self.init_state_path))
+                    self.load_state_dict(self._init_state)
 
+                    # OLS warm-start + (base_rom) Sigma_mu_hat build, in one call
                     if self.pred_model == 'linear':
-                        # Initialize the prediction layer weights to OLS regression weights
-                        X_train, Y_train = Xtr.copy(), Y_temp.train()
-                        X_train.insert(0,'ones', 1.0)
-
-                        X_train = Variable(torch.tensor(X_train.values, dtype=torch.double))
-                        Y_train = Variable(torch.tensor(Y_train.values, dtype=torch.double))
-
-                        Theta = torch.linalg.lstsq(X_train, Y_train).solution.T
-                        del X_train, Y_train
-
-                        with torch.no_grad():
-                            self.pred_layer.bias.copy_(Theta[:,0])
-                            self.pred_layer.weight.copy_(Theta[:,1:])
-
-                    if self.model_type == 'base_rom':
-                        self.update_sigma_mu_hat(Xtr)
+                        self.fit_predictor(Xtr, Y_temp.train())
 
                     val_loss = self.net_train(train_set, val_set=val_set, lr=lr, epochs=epochs)
                     val_loss_tot.append(val_loss)
@@ -840,9 +896,12 @@ class e2e_net(nn.Module):
                 results.epochs.append(epochs)
                 print('================================================')
 
-        # Convert results to dataframe
+        # Convert results to dataframe. Disambiguate the pickle by opt_layer + pred_model + seed
+        # so tv/hellinger (both model_type='dro') and different-seed runs never collide.
         self.cv_results = results.df()
-        self.cv_results.to_pickle(self.init_state_path+'_results.pkl')
+        cv_path = f"{self.cache_path}cv_{self.opt_layer_name}_{self.pred_model}_seed{self.seed}.pkl"
+        os.makedirs(os.path.dirname(cv_path) or '.', exist_ok=True)
+        self.cv_results.to_pickle(cv_path)
 
         # Select and store the optimal hyperparameters
         idx = self.cv_results.val_loss.idxmin()
@@ -919,28 +978,13 @@ class e2e_net(nn.Module):
             test_set = DataLoader(pc.SlidingWindow(Xte, Y.test(), self.n_obs, 1))
 
             # Reset learnable parameters gamma and delta
-            self.load_state_dict(torch.load(self.init_state_path))
+            self.load_state_dict(self._init_state)
 
+            # OLS warm-start + (base_rom) Sigma_mu_hat build, in one call. Theta is kept for the
+            # theta_dist_L2 bookkeeping below.
+            Theta = None
             if self.pred_model == 'linear':
-                # Initialize the prediction layer weights to OLS regression weights
-                X_train, Y_train = Xtr.copy(), Y.train()
-                X_train.insert(0,'ones', 1.0)
-
-                device = self.pred_layer.weight.device
-                X_cpu = torch.tensor(X_train.values, dtype=torch.double)
-                Y_cpu = torch.tensor(Y_train.values, dtype=torch.double)
-                Theta = torch.linalg.lstsq(X_cpu, Y_cpu).solution.T.to(device)
-                del X_train, Y_train, X_cpu, Y_cpu
-
-                with torch.no_grad():
-                    self.pred_layer.bias.copy_(Theta[:,0])
-                    self.pred_layer.weight.copy_(Theta[:,1:])
-
-            # Update Sigma_mu_hat for base_rom using OLS-initialised B and current window's Cov(x)
-            if self.model_type == 'base_rom':
-                diag_info = self.update_sigma_mu_hat(Xtr)
-                if diag_info.get('updated', False):
-                    print(f"  Sigma_mu_hat updated (trace: {diag_info['sigma_mu_hat_trace']:.2e}, rank: {diag_info['rank']})")
+                Theta = self.fit_predictor(Xtr, Y.train())
 
             train_dev = DeviceDataLoader(train_set, device)
             test_dev  = DeviceDataLoader(test_set, device)

@@ -47,7 +47,12 @@ class SlidingWindow(Dataset):
         return (x, y, y_perf)
 
     def __len__(self):
-        return len(self.X) - self.n_obs - self.perf_period
+        # Number of valid windows. A window at index i needs both a full feature slice
+        # X[i : i+n_obs+1] and a full perf slice Y[i+n_obs : i+n_obs+perf_period]; the binding
+        # constraint is max(perf_period, 1) (the feature slice needs at least one forward row).
+        # The prior formula dropped the last valid window for perf_period >= 1; max(...,1)
+        # keeps the perf_period=0 path (gamma_range) correct, where a naive +1 would over-run.
+        return len(self.X) - self.n_obs - max(self.perf_period, 1) + 1
 
 ####################################################################################################
 # Backtest object to store out-of-sample results

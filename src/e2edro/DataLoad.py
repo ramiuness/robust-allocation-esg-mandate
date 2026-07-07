@@ -3,6 +3,7 @@
 ####################################################################################################
 ## Import libraries
 ####################################################################################################
+import re
 import torch
 import torch.nn as nn
 import pandas as pd
@@ -473,6 +474,16 @@ def _calibrate_to_target(Y_base, target_mean, target_cov):
 # Fetch market data from Kenneth French's data library and Yahoo Finance
 # https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/data_library.html
 ####################################################################################################
+class _MomentumFactorReader(pdr.famafrench.FamaFrenchReader):
+    """Fetch the Fama-French momentum factor, stripping the trailing empty column
+    Ken French's daily file now carries. Without this, blank separator lines become
+    ',,' and pandas_datareader's header regex (^\\s*,) latches onto one above the
+    real header, parsing the footer annotation as a date (DateParseError). The strip
+    is a no-op if the file reverts, so it is never worse than the stock reader."""
+    def _read_zipfile(self, url):
+        return re.sub(r",+(?=\r?\n)", "", super()._read_zipfile(url))
+
+
 def fetch_market_data(start:str, end:str, split:list, freq:str='weekly', n_obs:int=104, n_y=None,
                       use_cache:bool=False, save_results:bool=False):
     """Fetch historical market data from Kenneth French's data library and Yahoo Finance.
@@ -530,7 +541,7 @@ def fetch_market_data(start:str, end:str, split:list, freq:str='weekly', n_obs:i
                     end=end)[0]
         rf_df = X['RF']
         X = X.drop(['RF'], axis=1)
-        mom_df = pdr.get_data_famafrench('F-F_Momentum_Factor'+dl_freq, start=start, end=end)[0]
+        mom_df = _MomentumFactorReader('F-F_Momentum_Factor'+dl_freq, start=start, end=end).read()[0]
         st_df = pdr.get_data_famafrench('F-F_ST_Reversal_Factor'+dl_freq, start=start, end=end)[0]
         lt_df = pdr.get_data_famafrench('F-F_LT_Reversal_Factor'+dl_freq, start=start, end=end)[0]
 

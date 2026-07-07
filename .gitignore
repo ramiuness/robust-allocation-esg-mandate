@@ -22,3 +22,8 @@ cache/
 
 # OS
 .DS_Store
+
+# Personal / transient
+CLAUDE.local.md
+ENGINEERING_CHOICES.md
+spo-critical-review.md

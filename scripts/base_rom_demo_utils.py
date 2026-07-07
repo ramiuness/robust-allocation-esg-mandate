@@ -17,8 +17,15 @@ Import patterns in use: `from base_rom_demo_utils import *` (pulls in np, pd,
 torch, dl + every helper, keeping setup cells short), explicit
 `from base_rom_demo_utils import (...)`, and the `_px`-aliased explicit import.
 """
-import copy as _copy
 import os as _os
+
+# CUDA-deterministic reductions must be configured before torch initializes CUDA.
+# The DRO cone programs (esp. TV) are ill-conditioned enough that the ~1e-7 GPU
+# reduction noise amplifies to full-cap weight swings; together with the per-layer
+# solver args + reject-inaccurate wrapper below and use_deterministic_algorithms()
+# in set_seeds(), this makes same-seed/same-data runs bit-reproducible
+# (see spo-critical-review.md Part II).
+_os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import numpy as np
 import pandas as pd
@@ -38,10 +45,74 @@ _REPO_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
 
 
 def set_seeds(seed=42):
-    """Seed numpy and torch in one call. Returns the seed."""
+    """Seed numpy and torch, and enable deterministic algorithms. Returns the seed.
+
+    Deterministic mode removes the last nondeterminism source in the train-once/
+    allocate workflow — CUDA reductions — so B/y_hat/ep are bit-identical across
+    runs and the (deterministic) ECOS/diffcp solves return identical weights for
+    the same seed and data. warn_only=True keeps it from erroring on any op that
+    lacks a deterministic CUDA kernel (none of the ops in this pipeline do, but it
+    is the safe default). See spo-critical-review.md Part II.
+    """
     np.random.seed(seed)
     torch.manual_seed(seed)
+    torch.use_deterministic_algorithms(True, warn_only=True)
     return seed
+
+
+# ---------------------------------------------------------------------------
+# Solver configuration  (see spo-critical-review.md Part II). The robust solve strategy
+# (strict -> relaxed retry -> equal-weight fallback, with the '*_inacc' band collapsed so an
+# inaccurate solve raises instead of being silently accepted) now lives IN the library as
+# e2e.robust_solve, configured via constructor args. The harness only *supplies* the per-opt_layer
+# settings below to build_models -- there is NO CvxpyLayer.forward monkeypatch.
+# ---------------------------------------------------------------------------
+
+# The '*_inacc' thresholds are set EQUAL to the strict tolerances on purpose: this
+# collapses ECOS's "inaccurate" fallback band so a solve that cannot reach the strict
+# tolerance RAISES (diffcp only warns on flag-10 otherwise, and cvxpylayers would
+# silently accept the noisy iterate) — which the robust wrapper then catches and
+# retries at _RETRY_ARGS. Without this, reject-inaccurate never engages.
+def _ecos(tol, max_iters):
+    return {'solve_method': 'ECOS', 'max_iters': max_iters, 'verbose': False,
+            'abstol': tol, 'reltol': tol, 'feastol': tol,
+            'abstol_inacc': tol, 'reltol_inacc': tol, 'feastol_inacc': tol}
+
+SOLVER_ARGS = {
+    'base_mod':  _ecos(1e-10, 10000),
+    'base_rom':  _ecos(1e-9,  10000),
+    'nominal':   _ecos(1e-8,  20000),
+    'tv':        _ecos(1e-8,  20000),
+    'hellinger': _ecos(1e-8,  20000),
+}
+# Relaxed retry for a window that cannot reach its strict tolerance.
+_RETRY_ARGS = {'solve_method': 'ECOS', 'max_iters': 50000, 'verbose': False,
+               'abstol': 1e-6, 'reltol': 1e-6, 'feastol': 1e-6}
+
+# Event tags recorded per solve and read back by solve_report().
+_EVENT_RETRY = 'retry'        # solve reached only the relaxed tolerance
+_EVENT_FALLBACK = 'fallback'  # solve failed even relaxed -> equal-weight z
+_PHASES = ('calibrate', 'train', 'infer')
+
+# Solve events are recorded by e2e.robust_solve into model._solve_log as (phase, event); the
+# phase is set on each model via `model._solve_phase = phase` before each solve batch (see
+# calibrate_models / fit_window / infer_window). No module-level context or monkeypatch is needed.
+
+
+def solve_report(models):
+    """Per-model table of solver retries and fallbacks, split by phase.
+
+    A clean run is all zeros. Nonzero 'infer' entries are the allocation windows that
+    could not be solved to strict tolerance — retried at the relaxed 1e-6, or (for a
+    fallback) replaced by equal weight. See spo-critical-review.md Part II.
+    """
+    labels = {_EVENT_RETRY: 'retry', _EVENT_FALLBACK: 'fallback'}
+    rows = {}
+    for name, model in models.items():
+        log = getattr(model, '_solve_log', [])
+        rows[name] = {f'{label}_{phase}': log.count((phase, event))
+                      for event, label in labels.items() for phase in _PHASES}
+    return pd.DataFrame(rows).T
 
 
 def load_data(start='2020-01-02', end='2025-12-31', n_y=20, n_obs=104,
@@ -79,6 +150,7 @@ __all__ = [
     'plot_all_wealth', 'plot_drawdown', 'plot_summary_bars',
     'build_models', 'calibrate_models', 'fit_window', 'infer_window',
     'date_window', 'run_window', 'trained_params', 'model_report',
+    'SOLVER_ARGS', 'solve_report',
 ]
 
 # ---------------------------------------------------------------------------
@@ -186,32 +258,48 @@ def plot_epsilon_trajectory(spo_rom, n_roll, figsize=(8, 4)):
     plt.show()
 
 
-def plot_weight_heatmap(po_rom, spo_rom, asset_labels, figsize=(16, 7)):
-    """Side-by-side weight heatmaps for PO-ROM and SPO-ROM over time."""
-    dates = spo_rom.portfolio.rets.index
-    n_y   = len(asset_labels)
-    fig, axes = plt.subplots(1, 2, figsize=figsize, sharey=True)
-    for ax, model, title, cmap in zip(
-        axes,
-        [po_rom, spo_rom],
-        ['PO-ROM (fixed ε = 0.5)', 'SPO-ROM (learned ε)'],
-        ['Blues', 'Reds']
-    ):
-        w         = model.portfolio.weights
-        n_periods = w.shape[0]
-        im        = ax.imshow(w.T, aspect='auto', cmap=cmap,
-                              interpolation='nearest', vmin=0)
-        tick_pos  = np.linspace(0, n_periods - 1, min(8, n_periods), dtype=int)
-        tick_lab  = [dates[i].strftime('%Y-%m') for i in tick_pos]
-        ax.set_xticks(tick_pos)
-        ax.set_xticklabels(tick_lab, rotation=45, fontsize=7)
+def plot_weight_heatmap(portfolios, asset_labels=None, names=None, ncols=2, figsize=None):
+    """Grid of allocation-weight heatmaps — one panel per portfolio.
+
+    portfolios : dict {label: source}. Each source is a pc.backtest (e.g. a value of
+                 the `ports` dict from run_window / infer_window) OR a fitted model
+                 carrying `.portfolio` (the net_roll_test workflow); both expose
+                 .weights [periods x assets] and .dates.
+    asset_labels : y-axis tick labels (e.g. Y.data.columns); default 0..n_y-1.
+    names        : subset/order of labels to plot; default all keys of `portfolios`.
+    ncols        : panels per row.
+    figsize      : figure size; default scales with the grid.
+    """
+    names = list(portfolios) if names is None else names
+    ncols = min(ncols, len(names))
+    nrows = int(np.ceil(len(names) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=figsize or (7.5 * ncols, 3.2 * nrows),
+                             squeeze=False)
+    for ax, name in zip(axes.flat, names):
+        bt = getattr(portfolios[name], 'portfolio', portfolios[name])   # model -> its backtest
+        w = np.asarray(bt.weights)
+        n_periods, n_y = w.shape
+        dates = getattr(bt, 'dates', None)
+        if w.min() < 0:                                        # long-short: diverging at 0
+            vmax = np.abs(w).max()
+            im = ax.imshow(w.T, aspect='auto', cmap='RdBu_r', vmin=-vmax, vmax=vmax,
+                           interpolation='nearest')
+        else:                                                  # long-only: sequential from 0
+            im = ax.imshow(w.T, aspect='auto', cmap='viridis', vmin=0, interpolation='nearest')
+        if dates is not None:
+            tick = np.linspace(0, n_periods - 1, min(6, n_periods), dtype=int)
+            ax.set_xticks(tick)
+            ax.set_xticklabels([dates[i].strftime('%Y-%m') for i in tick],
+                               rotation=45, fontsize=7)
         ax.set_yticks(range(n_y))
-        ax.set_yticklabels(asset_labels, fontsize=7)
-        ax.set_xlabel('Date')
-        ax.set_title(title)
-        plt.colorbar(im, ax=ax, label='Weight')
-    plt.suptitle('Portfolio Weights Over Time', fontsize=13)
-    plt.tight_layout()
+        ax.set_yticklabels(list(asset_labels) if asset_labels is not None else range(n_y),
+                           fontsize=6)
+        ax.set_title(str(name), fontsize=10)
+        fig.colorbar(im, ax=ax, label='weight')
+    for ax in axes.flat[len(names):]:                          # hide unused grid cells
+        ax.axis('off')
+    fig.suptitle('Allocation weights over time', fontsize=13)
+    fig.tight_layout()
     plt.show()
 
 
@@ -328,13 +416,19 @@ def build_models(cfg, n_x, n_y, n_obs, which=None):
     which   : optional iterable of model names to keep (default: all eight).
     returns : dict {name: model} with cfg attached to every model.
     """
+    # Robust-solve config passed to the (owned) library solve strategy: per-opt_layer strict
+    # settings + relaxed retry + equal-weight fallback (replaces the old forward monkeypatch).
+    _retry = dict(solve_retry_args=_RETRY_ARGS, solve_fallback=True)
+
     ew = bm.equal_weight(n_x=n_x, n_y=n_y, n_obs=n_obs)
     po_m = bm.pred_then_opt(n_x, n_y, n_obs, opt_layer='base_mod',
                             max_weight=cfg['max_weight'], long_short=cfg['long_short'],
-                            set_seed=cfg['seed']).double()
+                            set_seed=cfg['seed'], solver_args=SOLVER_ARGS['base_mod'], **_retry).double()
+    po_m._opt_layer = 'base_mod'
     po_rom = bm.pred_then_opt(n_x, n_y, n_obs, opt_layer='base_rom', epsilon=0.5,
                               max_weight=cfg['max_weight'], long_short=cfg['long_short'],
-                              set_seed=cfg['seed']).double()
+                              set_seed=cfg['seed'], solver_args=SOLVER_ARGS['base_rom'], **_retry).double()
+    po_rom._opt_layer = 'base_rom'
 
     shared = dict(n_x=n_x, n_y=n_y, n_obs=n_obs, pred_model='linear',
                   epochs=cfg['epochs'], lr=cfg['lr'], weight_decay=cfg['weight_decay'],
@@ -345,11 +439,10 @@ def build_models(cfg, n_x, n_y, n_obs, which=None):
         kw = dict(spec)
         if kw['opt_layer'] in ('nominal', 'tv', 'hellinger'):
             kw['gamma_lr'] = cfg['gamma_lr']
-        m = e2e_net(**shared, **kw).double()
-        # In-memory pristine snapshot used by fit_window's reset. Per-object, so
-        # SPO-TV and SPO-Hellinger (both model_type='dro') no longer alias the
-        # library's shared on-disk init_state file.
-        m._init_state = _copy.deepcopy(m.state_dict())
+        m = e2e_net(**shared, **kw, solver_args=SOLVER_ARGS[kw['opt_layer']], **_retry).double()
+        m._opt_layer = kw['opt_layer']
+        # _init_state (the in-memory pristine snapshot fit_window resets from) is now created by
+        # e2e_net.__init__ itself -- per-object, so tv/hellinger can't alias each other.
         models[name] = m
 
     for name, m in models.items():
@@ -365,7 +458,7 @@ def calibrate_models(models, X_train, Y_train, target_ratio=None):
 
     pred_loss_factor must be calibrated *at the OLS initialization* (see CLAUDE.md
     and e2e_net.calibrate_pred_loss_factor), so each model is OLS warm-started here
-    — with the same _ols_init / update_sigma_mu_hat that fit_window applies — before
+    — with the same fit_predictor (OLS + Sigma_mu_hat) that fit_window applies — before
     the calibration forward pass. The OLS init is deterministic in (X_train, Y_train),
     so the later fit_window(reset=True) re-derives the identical weights; pred_loss_factor
     is a plain attribute and survives that reset.
@@ -382,9 +475,8 @@ def calibrate_models(models, X_train, Y_train, target_ratio=None):
     for name, m in models.items():
         if isinstance(m, e2e_net) and m.pred_loss is not None:
             tr = target_ratio if target_ratio is not None else m.cfg.get('target_ratio', 0.5)
-            _ols_init(m, X_train, Y_train)
-            if m.model_type == 'base_rom':
-                m.update_sigma_mu_hat(X_train)
+            m.fit_predictor(X_train, Y_train)   # OLS warm-start + (base_rom) Sigma_mu_hat build
+            m._solve_phase = 'calibrate'
             out[name] = m.calibrate_pred_loss_factor(X_train, Y_train, tr)
     return out
 
@@ -399,26 +491,6 @@ def _standardize(X_train_df, *others):
     sigma = X_train_df.std().replace(0.0, 1.0)   # guard a constant feature
     z = lambda d: (d - mu) / sigma
     return z(X_train_df) if not others else (z(X_train_df), *(z(o) for o in others))
-
-
-def _ols_init(model, X_train_df, Y_train_df):
-    """Warm-start model.pred_layer with OLS weights (shared by fit_window).
-
-    model       : pred_then_opt or e2e_net with a linear pred_layer.
-    X_train_df  : feature DataFrame (no intercept column).
-    Y_train_df  : return DataFrame, positionally aligned with X_train_df.
-    returns     : Theta (n_y x [1+n_x]) OLS solution, [bias | weights].
-    """
-    Xt = X_train_df.copy()
-    Xt.insert(0, 'ones', 1.0)
-    device = model.pred_layer.weight.device
-    X_cpu = torch.tensor(Xt.values, dtype=torch.double)
-    Y_cpu = torch.tensor(Y_train_df.values, dtype=torch.double)
-    Theta = torch.linalg.lstsq(X_cpu, Y_cpu).solution.T.to(device)
-    with torch.no_grad():
-        model.pred_layer.bias.copy_(Theta[:, 0])
-        model.pred_layer.weight.copy_(Theta[:, 1:])
-    return Theta
 
 
 def _stash_fit_attrs(model, X_train_df, Y_train_df, Theta):
@@ -459,19 +531,16 @@ def fit_window(model, X_train_df, Y_train_df, *, reset=True):
         return model
 
     if isinstance(model, bm.pred_then_opt):
-        Theta = _ols_init(model, X_train_df, Y_train_df)
-        if model.model_type == 'base_rom':
-            model.update_sigma_mu_hat(X_train_df)
+        Theta = model.fit_predictor(X_train_df, Y_train_df)   # OLS + (base_rom) Sigma_mu_hat
         _stash_fit_attrs(model, X_train_df, Y_train_df, Theta)
         return model
 
     # e2e_net
     if reset and hasattr(model, '_init_state'):
         model.load_state_dict(model._init_state)
-    Theta = _ols_init(model, X_train_df, Y_train_df)
-    if model.model_type == 'base_rom':
-        model.update_sigma_mu_hat(X_train_df)
+    Theta = model.fit_predictor(X_train_df, Y_train_df)       # OLS + (base_rom) Sigma_mu_hat
     train_set = DataLoader(pc.SlidingWindow(X_train_df, Y_train_df, model.n_obs, model.perf_period))
+    model._solve_phase = 'train'
     model.net_train(train_set)
     _stash_fit_attrs(model, X_train_df, Y_train_df, Theta)
     return model
@@ -487,7 +556,7 @@ def infer_window(model, X_df, Y_df):
     matching date_window's trailing buffer; it is not a user choice).
 
     model   : a fitted model (equal_weight uses 1/n weights).
-    X_df    : feature DataFrame covering [pred_start - n_obs ... pred_end (+1)].
+    X_df    : feature DataFrame covering [pred_start - n_obs ... pred_end].
     Y_df    : return DataFrame, positionally aligned with X_df.
     returns : pc.backtest with weights, rets, dates and computed stats().
     """
@@ -495,6 +564,8 @@ def infer_window(model, X_df, Y_df):
     ds = pc.SlidingWindow(X_df, Y_df, n_obs, 1)
     is_ew = isinstance(model, bm.equal_weight) or not hasattr(model, 'forward')
     device = next(model.parameters()).device if not is_ew else None
+    if not is_ew:
+        model._solve_phase = 'infer'
 
     weights, rets, dates = [], [], []
     with torch.no_grad():
@@ -523,8 +594,8 @@ def date_window(X, Y, train_end=None, pred_start=None, pred_end=None):
 
     Both X.data and Y.data are sliced by the SAME integer positions so the
     existing X / lagged-Y alignment is preserved. The test slice prepends n_obs
-    lookback rows (and one trailing row) so infer_window can predict the full
-    [pred_start, pred_end] range.
+    lookback rows and is sized (via n_pred) so infer_window emits predictions for
+    exactly the [pred_start, pred_end] range.
 
     X, Y       : TrainTest objects from fetch_data_from_disk.
     train_end  : last training date (inclusive). Default: just before pred_start.
@@ -555,12 +626,23 @@ def date_window(X, Y, train_end=None, pred_start=None, pred_end=None):
             f"Insufficient lookback: pred_start position {p_start} < n_obs={n_obs}. "
             f"Move pred_start at least {n_obs} observations into the data."
         )
-    b = min(p_end + 2, n)
+    # Derive the frame end from the number of decisions we want, so the SlidingWindow emits
+    # predictions for exactly [pred_start, pred_end] and no magic buffer is needed:
+    #   len(SlidingWindow(frame, n_obs, perf_period=1)) == frame_len - n_obs == n_pred.
+    n_pred = p_end - p_start + 1                 # decisions wanted (inclusive)
+    b = min(a + n_obs + n_pred, n)               # frame length so len(SlidingWindow)==n_pred
 
     X_train_df = X.data.iloc[:t_end + 1]
     Y_train_df = Y.data.iloc[:t_end + 1]
     X_test_df = X.data.iloc[a:b]
     Y_test_df = Y.data.iloc[a:b]
+
+    # Machine-checked invariant: the test frame yields exactly the intended decision count.
+    # Guards against date_window and SlidingWindow.__len__ silently drifting apart again.
+    assert len(pc.SlidingWindow(X_test_df, Y_test_df, n_obs, 1)) == n_pred, (
+        f"date_window/SlidingWindow mismatch: got "
+        f"{len(pc.SlidingWindow(X_test_df, Y_test_df, n_obs, 1))} windows, expected {n_pred}"
+    )
 
     # Standardize on this window's train slice; apply to train + test (incl. the
     # n_obs lookback rows in X_test_df). The test stats come from the past only.
@@ -568,7 +650,7 @@ def date_window(X, Y, train_end=None, pred_start=None, pred_end=None):
     return X_train_df, Y_train_df, X_test_df, Y_test_df
 
 
-def run_window(models, X, Y, train_end, pred_start=None, pred_end=None):
+def run_window(models, X, Y, train_end, pred_start=None, pred_end=None, report=True):
     """Fit every model on the train slice and infer on the holdout slice.
 
     models     : dict {name: model} from build_models (already calibrated).
@@ -576,6 +658,7 @@ def run_window(models, X, Y, train_end, pred_start=None, pred_end=None):
     train_end  : last training date (inclusive).
     pred_start : first prediction date (default: just after train_end).
     pred_end   : last prediction date (default: end of data).
+    report     : if True, print the solver retry/fallback summary after fitting.
     returns    : dict {name: pc.backtest} of out-of-sample portfolios.
     """
     Xtr, Ytr, Xte, Yte = date_window(X, Y, train_end, pred_start, pred_end)
@@ -583,6 +666,14 @@ def run_window(models, X, Y, train_end, pred_start=None, pred_end=None):
     for name, m in models.items():
         fit_window(m, Xtr, Ytr)
         ports[name] = infer_window(m, Xte, Yte)
+    if report:
+        rep = solve_report(models)
+        active = rep[(rep != 0).any(axis=1)]
+        if len(active):
+            print('Solver retries / fallbacks (windows below strict tolerance):')
+            print(active.to_string())
+        else:
+            print('Solver: all windows reached strict tolerance (no retries/fallbacks).')
     return ports
 
 

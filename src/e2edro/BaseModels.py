@@ -4,8 +4,6 @@
 ## Import libraries
 ####################################################################################################
 import numpy as np
-import cvxpy as cp
-from cvxpylayers.torch import CvxpyLayer
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -18,62 +16,12 @@ import e2edro.e2edro as e2e
 
 
 ####################################################################################################
-# CvxpyLayers: Differentiable optimization layers (nominal and distributionally robust)
-####################################################################################################
-#---------------------------------------------------------------------------------------------------
-# base_mod: CvxpyLayer that declares the portfolio optimization problem
-#---------------------------------------------------------------------------------------------------
-def base_mod(n_y, n_obs, prisk, max_weight=1.0, long_short=False):
-    """Base optimization problem declared as a CvxpyLayer object
-
-    Inputs
-    n_y: number of assets
-    n_obs: Number of scenarios in the dataset
-    prisk: Portfolio risk function. Not used in the code but included for the purpose of maintaining the optimization interface consistency.
-    max_weight: Maximum weight per asset (default 1.0 = unconstrained long-only).
-    long_short: If True, allows short positions (removes nonneg constraint, adds z >= -max_weight).
-
-    Variables
-    z: Decision variable. (n_y x 1) vector of decision variables (e.g., portfolio weights)
-
-    Parameters
-    y_hat: (n_y x 1) vector of predicted outcomes
-
-    Constraints
-    Total budget is equal to 100%, sum(z) == 1
-    Long-only by default; long_short=True removes non-negativity and adds symmetric short bound.
-
-    Objective
-    Minimize -y_hat @ z
-    """
-    # Variables
-    z = cp.Variable((n_y, 1)) if long_short else cp.Variable((n_y, 1), nonneg=True)
-
-    # Parameters
-    y_hat = cp.Parameter(n_y)
-
-    # Constraints
-    constraints = [cp.sum(z) == 1]
-    if max_weight < 1.0:
-        constraints.append(z <= max_weight)
-    if long_short:
-        constraints.append(z >= -max_weight)
-
-    # Objective function
-    objective = cp.Minimize(-y_hat @ z)
-
-    # Construct optimization problem and differentiable layer
-    problem = cp.Problem(objective, constraints)
-
-    return CvxpyLayer(problem, parameters=[y_hat], variables=[z])
-
-####################################################################################################
 # Naive 'predict-then-optimize'
 ####################################################################################################
 class pred_then_opt(nn.Module):
     """Naive 'predict-then-optimize' portfolio construction module
     """
-    def __init__(self, n_x, n_y, n_obs, epsilon=0.5, set_seed=None, prisk='p_var', opt_layer='nominal', cache_path='./cache/', max_weight=1.0, long_short=False):
+    def __init__(self, n_x, n_y, n_obs, epsilon=0.5, set_seed=42, prisk='p_var', opt_layer='nominal', cache_path='./cache/', max_weight=1.0, long_short=False, solver_args=None, solve_retry_args=None, solve_fallback=False):
         """Naive 'predict-then-optimize' portfolio construction module
 
         This NN module implements a linear prediction layer 'pred_layer' and an optimization layer 
@@ -90,9 +38,11 @@ class pred_then_opt(nn.Module):
         """
         super(pred_then_opt, self).__init__()
 
+        # Local RNG for parameter init (see e2e_net): order-independent, leaves global RNG alone.
+        self.seed = set_seed
+        gen = torch.Generator()
         if set_seed is not None:
-            torch.manual_seed(set_seed)
-            self.seed = set_seed
+            gen.manual_seed(set_seed)
 
         self.n_x = n_x
         self.n_y = n_y
@@ -101,13 +51,19 @@ class pred_then_opt(nn.Module):
         self.long_short = long_short  # Allow short positions if True
         self.perf_period = 13
 
+        # Feasibility: an active per-asset cap must admit a feasible budget (sum(z)==1).
+        if max_weight < 1.0 and max_weight * n_y < 1.0:
+            raise ValueError(
+                f"Infeasible: max_weight={max_weight} with n_y={n_y} assets. "
+                f"Need max_weight >= {1.0/n_y:.4f} (= 1/n_y) for feasibility."
+            )
+
         # Store epsilon and prisk for layer rebuild capability
         self.epsilon_fixed = epsilon
-        self.prisk_func = eval('rf.'+prisk)
+        self.prisk_func = getattr(rf, prisk)
 
         # Register 'gamma' (risk-return trade-off parameter)
-        # self.gamma = nn.Parameter(torch.FloatTensor(1).uniform_(0.037, 0.173))
-        self.gamma = nn.Parameter(torch.FloatTensor(1).uniform_(0.02, 0.1))
+        self.gamma = nn.Parameter(torch.empty(1).uniform_(0.02, 0.1, generator=gen))
         self.gamma.requires_grad = False
 
         # Record the model design: nominal, base, base_rom or DRO
@@ -127,7 +83,7 @@ class pred_then_opt(nn.Module):
             else:
                 ub = (1 - 1/n_obs) / 2
                 lb = (1 - 1/n_obs) / 10
-            self.delta = nn.Parameter(torch.FloatTensor(1).uniform_(lb, ub))
+            self.delta = nn.Parameter(torch.empty(1).uniform_(lb, ub, generator=gen))
             self.delta.requires_grad = False
             self.model_type = 'dro' 
 
@@ -137,20 +93,30 @@ class pred_then_opt(nn.Module):
         self.pred_layer.bias.requires_grad = False
         
 
-        # LAYER: Optimization model
-        if opt_layer == 'base_mod':
-            self.opt_layer = base_mod(n_y, n_obs, eval('rf.'+prisk),
-                                      max_weight=max_weight, long_short=long_short)
-        elif opt_layer == 'base_rom':
-            placeholder = np.eye(n_y)
-            self.sigma_mu_hat = placeholder
-            self.opt_layer = e2e.base_rom(n_y, n_obs, eval('rf.'+prisk), placeholder,
-                                          max_weight=max_weight, long_short=long_short)
+        # LAYER: Optimization model. All builders live in e2edro (e2e); dispatch by name via
+        # getattr so pred_then_opt supports every opt_layer (base_mod/nominal/tv/hellinger),
+        # not just the ones with a local copy. base_rom needs the sigma_mu_hat argument.
+        if opt_layer == 'base_rom':
+            # Sigma_mu_hat = B Cov(x) B^T needs data + the OLS-fitted B; built lazily by
+            # fit_predictor(). No identity placeholder (there is no correct one) -> forbid use.
+            self.sigma_mu_hat = None
+            self.opt_layer = None
         else:
-            self.opt_layer = eval(opt_layer)(n_y, n_obs, eval('rf.'+prisk),
-                                             max_weight=max_weight, long_short=long_short)
+            self.opt_layer = getattr(e2e, opt_layer)(n_y, n_obs, self.prisk_func,
+                                                     max_weight=max_weight, long_short=long_short)
         # Store reference path to store model data
         self.cache_path = cache_path
+
+        # Solver strategy (owned; shared with e2e_net via e2e.robust_solve). Defaults per
+        # model_type with '*_inacc' collapsed onto strict; retry/fallback off by default.
+        self.solver_args = solver_args if solver_args is not None else e2e.default_solver_args(self.model_type)
+        self.solve_retry_args = solve_retry_args
+        self.solve_fallback = solve_fallback
+        self._solve_log = []
+        self._solve_phase = None
+
+        # Cast parameters/submodules to double after all exist (SlidingWindow emits float64).
+        self.double()
 
     #-----------------------------------------------------------------------------------------------
     # forward: forward pass of the e2e neural net
@@ -180,19 +146,19 @@ class pred_then_opt(nn.Module):
         ep = Y - Y_hat[:-1]
         y_hat = Y_hat[-1]
 
-        # Optimization solver arguments (from CVXPY for SCS solver)
-        solver_args = {'solve_method': 'ECOS'}
-
-        # Optimize z per scenario
-        # Determine whether nominal or dro model
+        # Optimize z per scenario via the shared owned robust-solve strategy (self.solver_args).
         if self.model_type == 'nom':
-            z_star, = self.opt_layer(ep, y_hat, self.gamma, solver_args=solver_args)
+            z_star, = e2e.robust_solve(self, ep, y_hat, self.gamma)
         elif self.model_type == 'dro':
-            z_star, = self.opt_layer(ep, y_hat, self.gamma, self.delta, solver_args=solver_args)
+            z_star, = e2e.robust_solve(self, ep, y_hat, self.gamma, self.delta)
         elif self.model_type == 'base_mod':
-            z_star, = self.opt_layer(y_hat, solver_args=solver_args)
+            z_star, = e2e.robust_solve(self, y_hat)
         elif self.model_type == 'base_rom':
-            z_star, = self.opt_layer(y_hat, self.epsilon, solver_args=solver_args)
+            if self.opt_layer is None:
+                raise RuntimeError(
+                    "base_rom model is not fitted: call fit_predictor(X_train, Y_train) first."
+                )
+            z_star, = e2e.robust_solve(self, y_hat, self.epsilon)
 
         return z_star, y_hat
 
@@ -241,24 +207,8 @@ class pred_then_opt(nn.Module):
 
             test_set = DataLoader(pc.SlidingWindow(Xte, Y.test(), self.n_obs, 1))
 
-            X_train, Y_train = Xtr.copy(), Y.train()
-            X_train.insert(0,'ones', 1.0)
-
-            X_train = Variable(torch.tensor(X_train.values, dtype=torch.double))
-            Y_train = Variable(torch.tensor(Y_train.values, dtype=torch.double))
-
-            Theta = torch.linalg.lstsq(X_train, Y_train).solution.T
-            del X_train, Y_train
-
-            with torch.no_grad():
-                self.pred_layer.bias.copy_(Theta[:,0])
-                self.pred_layer.weight.copy_(Theta[:,1:])
-
-            # Update Sigma_mu_hat for base_rom using OLS-initialised B and current window's Cov(x)
-            if self.model_type == 'base_rom':
-                diag_info = self.update_sigma_mu_hat(Xtr)
-                if diag_info.get('updated', False):
-                    print(f"  Sigma_mu_hat updated (trace: {diag_info['sigma_mu_hat_trace']:.2e})")
+            # OLS warm-start + (base_rom) Sigma_mu_hat build, in one call.
+            self.fit_predictor(Xtr, Y.train())
 
             # Test model
             with torch.no_grad():
@@ -282,43 +232,29 @@ class pred_then_opt(nn.Module):
         self.portfolio = portfolio
 
     #-----------------------------------------------------------------------------------------------
-    # update_sigma_mu_hat: Update estimator covariance and rebuild base_rom layer
+    # fit_predictor: OLS warm-start and (base_rom) estimator-covariance build
     #-----------------------------------------------------------------------------------------------
-    def update_sigma_mu_hat(self, X_train):
-        """Recompute Sigma_mu_hat = B Cov(x) B^T from current OLS weights and rebuild opt_layer.
+    def fit_predictor(self, X_train, Y_train):
+        """OLS-warm-start the prediction layer from one training window; for base_rom also build
+        Sigma_mu_hat = B Cov(x) B^T and the opt_layer. B is fixed (no gradient learning) so a
+        single build per window suffices. Shares e2e.ols_theta with e2e_net; returns Theta.
 
-        Called once per roll window after OLS initialisation. B is fixed in pred_then_opt
-        (no gradient learning), so a single update per roll is sufficient.
-
-        Parameters
-        ----------
-        X_train : pd.DataFrame
-            Factor data for the current training window (without a ones column).
-
-        Returns
-        -------
-        dict
-            Diagnostic information (updated, sigma_mu_hat_trace).
+        X_train : feature DataFrame (standardized, no ones column). Y_train : aligned returns.
         """
-        diagnostics = {}
-        if self.model_type != 'base_rom':
-            diagnostics['updated'] = False
-            diagnostics['reason'] = f'Model type is {self.model_type}, not base_rom'
-            return diagnostics
-
-        B     = self.pred_layer.weight.detach().numpy()   # (n_y, n_x)
-        cov_x = X_train.cov().values                      # (n_x, n_x)
-        sigma_mu_hat_new = B @ cov_x @ B.T
-        self.sigma_mu_hat = sigma_mu_hat_new
-
-        self.opt_layer = e2e.base_rom(
-            self.n_y, self.n_obs, self.prisk_func,
-            sigma_mu_hat_new, self.max_weight, long_short=self.long_short
-        )
-
-        diagnostics['updated'] = True
-        diagnostics['sigma_mu_hat_trace'] = float(np.trace(sigma_mu_hat_new))
-        return diagnostics
+        device = self.pred_layer.weight.device
+        Theta = e2e.ols_theta(X_train, Y_train).to(device)
+        with torch.no_grad():
+            self.pred_layer.bias.copy_(Theta[:, 0])
+            self.pred_layer.weight.copy_(Theta[:, 1:])
+        if self.model_type == 'base_rom':
+            B = self.pred_layer.weight.detach().cpu().numpy()   # .cpu() -> works on GPU too
+            cov_x = X_train.cov().values
+            self.sigma_mu_hat = B @ cov_x @ B.T
+            self.opt_layer = e2e.base_rom(
+                self.n_y, self.n_obs, self.prisk_func,
+                self.sigma_mu_hat, self.max_weight, long_short=self.long_short
+            )
+        return Theta
 
 ####################################################################################################
 # Equal weight
@@ -459,22 +395,19 @@ class gamma_range(nn.Module):
         gamma: estimated gamma valules for each observation in the training set
         """
 
-        # Initialize the prediction layer weights to OLS regression weights
-        X_train, Y_train = X.train().copy(), Y.train()
-        X_train.insert(0,'ones', 1.0)
+        # Standardize features on the train window (consistent with the rest of the pipeline;
+        # the OLS fit used to run on RAW features here), then OLS-warm-start the prediction layer.
+        mu = X.train().mean()
+        sigma = X.train().std().replace(0.0, 1.0)
+        Xtr = (X.train() - mu) / sigma
 
-        X_train = Variable(torch.tensor(X_train.values, dtype=torch.double))
-        Y_train = Variable(torch.tensor(Y_train.values, dtype=torch.double))
-
-        Theta = torch.linalg.lstsq(X_train, Y_train).solution.T
-        del X_train, Y_train
-
+        Theta = e2e.ols_theta(Xtr, Y.train())
         with torch.no_grad():
             self.pred_layer.bias.copy_(Theta[:,0])
             self.pred_layer.weight.copy_(Theta[:,1:])
 
-       # Construct training and validation DataLoader objects
-        train_set = DataLoader(pc.SlidingWindow(X.train(), Y.train(), self.n_obs, 0))
+        # Construct training DataLoader on the SAME standardized features.
+        train_set = DataLoader(pc.SlidingWindow(Xtr, Y.train(), self.n_obs, 0))
 
         # Test model
         with torch.no_grad():
