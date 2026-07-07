@@ -41,6 +41,8 @@ import e2edro.PortfolioClasses as pc
 import e2edro.DataLoad as dl
 from e2edro.e2edro import e2e_net
 
+from run_report import RunReport
+
 _REPO_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
 
 
@@ -150,7 +152,7 @@ __all__ = [
     'plot_all_wealth', 'plot_drawdown', 'plot_summary_bars',
     'build_models', 'calibrate_models', 'fit_window', 'infer_window',
     'date_window', 'run_window', 'trained_params', 'model_report',
-    'SOLVER_ARGS', 'solve_report',
+    'SOLVER_ARGS', 'solve_report', 'RunReport',
 ]
 
 # ---------------------------------------------------------------------------
@@ -478,6 +480,10 @@ def calibrate_models(models, X_train, Y_train, target_ratio=None):
             m.fit_predictor(X_train, Y_train)   # OLS warm-start + (base_rom) Sigma_mu_hat build
             m._solve_phase = 'calibrate'
             out[name] = m.calibrate_pred_loss_factor(X_train, Y_train, tr)
+            rec = getattr(m, '_recorder', None)
+            if rec is not None:
+                rec.record_meta(m, pred_loss_factor=out[name], target_ratio=tr,
+                                weight_decay=m.weight_decay)
     return out
 
 
@@ -541,6 +547,7 @@ def fit_window(model, X_train_df, Y_train_df, *, reset=True):
     Theta = model.fit_predictor(X_train_df, Y_train_df)       # OLS + (base_rom) Sigma_mu_hat
     train_set = DataLoader(pc.SlidingWindow(X_train_df, Y_train_df, model.n_obs, model.perf_period))
     model._solve_phase = 'train'
+    model._solve_window = 0          # single-window run: all solves/epochs key to window 0
     model.net_train(train_set)
     _stash_fit_attrs(model, X_train_df, Y_train_df, Theta)
     return model
@@ -566,6 +573,7 @@ def infer_window(model, X_df, Y_df):
     device = next(model.parameters()).device if not is_ew else None
     if not is_ew:
         model._solve_phase = 'infer'
+        model._solve_window = 0
 
     weights, rets, dates = [], [], []
     with torch.no_grad():
@@ -574,6 +582,7 @@ def infer_window(model, X_df, Y_df):
             if is_ew:
                 w = np.ones(model.n_y) / model.n_y
             else:
+                model._solve_date = Y_df.index[j + n_obs]
                 z, _ = model(x.to(device), y.to(device))
                 w = z.squeeze().cpu().numpy()
             weights.append(w)
@@ -666,6 +675,9 @@ def run_window(models, X, Y, train_end, pred_start=None, pred_end=None, report=T
     for name, m in models.items():
         fit_window(m, Xtr, Ytr)
         ports[name] = infer_window(m, Xte, Yte)
+        rec = getattr(m, '_recorder', None)
+        if rec is not None:                     # single-window boundary -> lazy diagnostics
+            rec.on_window(m, 0, ports[name].dates, Xtr, Ytr)
     if report:
         rep = solve_report(models)
         active = rep[(rep != 0).any(axis=1)]

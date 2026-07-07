@@ -114,6 +114,9 @@ class pred_then_opt(nn.Module):
         self.solve_fallback = solve_fallback
         self._solve_log = []
         self._solve_phase = None
+        self._solve_window = None  # roll-window index; set by net_roll_test / infer_window
+        self._solve_date = None    # decision date; set per step at inference
+        self._recorder = None      # optional obs.Recorder sink; None => zero-overhead no-op
 
         # Cast parameters/submodules to double after all exist (SlidingWindow emits float64).
         self.double()
@@ -191,6 +194,7 @@ class pred_then_opt(nn.Module):
         for i in range(n_roll):
 
             print(f"Out-of-sample window: {i+1} / {n_roll}")
+            self._solve_window = i          # tag every solve in this window (report context)
 
             split[0] = init_split[0] + win_size * i
             if i < n_roll-1:
@@ -210,11 +214,14 @@ class pred_then_opt(nn.Module):
             # OLS warm-start + (base_rom) Sigma_mu_hat build, in one call.
             self.fit_predictor(Xtr, Y.train())
 
-            # Test model
+            # Test model  (predict-then-optimize is inference-only: no training phase)
+            self._solve_phase = 'infer'
+            test_dates = Y.test().index[self.n_obs:]
             with torch.no_grad():
                 for j, (x, y, y_perf) in enumerate(test_set):
-                
+
                     # Predict and optimize
+                    self._solve_date = test_dates[j] if j < len(test_dates) else None
                     z_star, _ = self(x.squeeze(), y.squeeze())
 
                     # Store portfolio weights and returns for each time step 't'
@@ -222,6 +229,10 @@ class pred_then_opt(nn.Module):
                     portfolio.rets[t] = y_perf.squeeze() @ portfolio.weights[t]
 
                     t += 1
+
+            # Window boundary: recorder computes lazy diagnostics only if this window failed.
+            if self._recorder is not None:
+                self._recorder.on_window(self, i, test_dates, Xtr, Y.train())
 
         # Reset dataset
         X, Y = X.split_update(init_split), Y.split_update(init_split)

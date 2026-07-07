@@ -4,10 +4,18 @@
 ## Import libraries
 ####################################################################################################
 import os
+import sys
 import copy
 import io
+import tempfile
+import ctypes
 import contextlib
 import warnings
+
+try:
+    _LIBC = ctypes.CDLL(None)            # for flushing C stdio (ECOS printf) during fd capture
+except OSError:                           # non-POSIX platform: fd capture degrades gracefully
+    _LIBC = None
 import numpy as np
 import pandas as pd
 import cvxpy as cp
@@ -17,10 +25,13 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.autograd import Variable
 
+import traceback as _traceback
+
 import e2edro.RiskFunctions as rf
 import e2edro.LossFunctions as lf
 import e2edro.PortfolioClasses as pc
 import e2edro.DataLoad as dl
+import e2edro.observability as obs
 
 import psutil
 num_cores = psutil.cpu_count()
@@ -348,39 +359,133 @@ def default_solver_args(model_type):
 
 
 @contextlib.contextmanager
-def _quiet_solver():
-    """Silence the cone solver's own stdout/stderr/warnings, scoped to a single solve call so it
-    never masks warnings raised elsewhere (e.g. torch's deterministic-algorithms warning)."""
-    with warnings.catch_warnings(), \
-            contextlib.redirect_stdout(io.StringIO()), \
-            contextlib.redirect_stderr(io.StringIO()):
-        warnings.simplefilter('ignore')
-        yield
+def _capture_solve_output():
+    """Capture the cone solver's warnings + stdout/stderr, scoped to a single solve call.
+
+    Yields a dict filled on exit with 'warnings' (list of str), 'stdout' and 'stderr'. This is the
+    reporting-era replacement for the old drop-everything `_quiet_solver`: the solver's output is
+    still kept off the console (so hundreds of solves don't flood logs), but it is now *recorded*
+    for robust_solve to attach to a SolveEvent instead of being silently discarded. Still scoped
+    via catch_warnings, so it neither leaks to nor masks warnings raised outside the solve.
+    """
+    captured = {'warnings': [], 'stdout': '', 'stderr': ''}
+    out, err = io.StringIO(), io.StringIO()
+    with warnings.catch_warnings(record=True) as wlist, \
+            contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        warnings.simplefilter('always')          # record every warning, including duplicates
+        try:
+            yield captured
+        finally:
+            captured['warnings'] = [str(w.message) for w in wlist]
+            captured['stdout'], captured['stderr'] = out.getvalue(), err.getvalue()
+
+
+@contextlib.contextmanager
+def _capture_fd():
+    """Capture C-level stdout (fd 1) into a string — e.g. ECOS's verbose iteration log, which is
+    printed from C and so escapes contextlib.redirect_stdout. Yields a 1-element list filled with
+    the captured text on exit. Scoped to a single solve; a temp file (not a pipe) avoids any
+    buffer-full deadlock on a long log. Used only on the (rare) verbose retry.
+    """
+    holder = ['']
+    sys.stdout.flush()
+    saved = os.dup(1)
+    tmp = tempfile.TemporaryFile(mode='w+b')
+    os.dup2(tmp.fileno(), 1)
+    try:
+        yield holder
+    finally:
+        sys.stdout.flush()
+        if _LIBC is not None:
+            _LIBC.fflush(None)           # flush C stdio into tmp BEFORE restoring fd (avoids leak)
+        os.dup2(saved, 1)
+        os.close(saved)
+        tmp.flush(); tmp.seek(0)
+        holder[0] = tmp.read().decode(errors='replace')
+        tmp.close()
+
+
+def _emit_solve(model, event, captured, *, read_info, exc=None):
+    """Build a SolveEvent from the just-completed solve and hand it to model._recorder.
+
+    No-op when no recorder is attached. `read_info` is False on the fallback path, where
+    opt_layer.info would be stale (no successful solve produced it). Context (phase/window/date)
+    is read from model state, matching how _solve_log already reads _solve_phase.
+    """
+    rec = getattr(model, '_recorder', None)
+    if rec is None:
+        return
+    info = (getattr(model.opt_layer, 'info', None) or {}) if read_info else {}
+    tb = ''.join(_traceback.format_exception(type(exc), exc, exc.__traceback__)) if exc else None
+    rec.record_solve(obs.SolveEvent(
+        model=getattr(model, '_name', None),
+        phase=getattr(model, '_solve_phase', None),
+        window=getattr(model, '_solve_window', None),
+        date=getattr(model, '_solve_date', None),
+        event=event,
+        solve_time=info.get('solve_time'),
+        canon_time=info.get('canon_time'),
+        shapes=info.get('shapes'),
+        warnings=tuple(captured['warnings']) if captured else (),
+        exc_type=type(exc).__name__ if exc else None,
+        exc_msg=str(exc) if exc else None,
+        traceback=tb,
+        solver_text=(captured['stdout'] + captured['stderr']) if captured else None,
+        # verbose_log = the ECOS iteration log from the verbose retry; present on both a successful
+        # retry and a fallback (where that retry then failed), i.e. whenever the verbose solve ran.
+        verbose_log=captured['stdout'] if (captured and event in ('retry', 'fallback')) else None,
+    ))
+
+
+def _grad_norm(params):
+    """L2 norm of the concatenated gradients of `params` (0.0 if none carry a grad)."""
+    total = 0.0
+    for p in params:
+        if p.grad is not None:
+            total += float(p.grad.detach().pow(2).sum())
+    return total ** 0.5
 
 
 def robust_solve(model, *params):
     """Solve model.opt_layer at model.solver_args; on failure retry at model.solve_retry_args
     (if set), then fall back to equal weight if model.solve_fallback, else re-raise. Retry/fallback
-    events are recorded in model._solve_log as (model._solve_phase, 'retry'/'fallback').
+    events are recorded in model._solve_log as (model._solve_phase, 'retry'/'fallback'); the full
+    per-solve record (timing, captured warnings/output, diagnostics context) is emitted to
+    model._recorder when one is attached (a no-op otherwise).
 
     This is the owned replacement for the harness's former CvxpyLayer.forward monkeypatch: the
     solve strategy is model state, configured via the constructor, not a runtime patch of a
     third-party class. Returns the layer's output tuple (z,).
     """
     try:
-        with _quiet_solver():
-            return model.opt_layer(*params, solver_args=model.solver_args)
-    except Exception:
+        with _capture_solve_output() as cap:
+            out = model.opt_layer(*params, solver_args=model.solver_args)
+        _emit_solve(model, 'optimal', cap, read_info=True)
+        return out
+    except Exception as strict_exc:
+        # Track the last failed attempt's detail so a fallback records *why* it failed (exception +
+        # captured solver output), not merely that it did. `cap` from the strict solve is populated.
+        last_exc, last_cap = strict_exc, cap
         if model.solve_retry_args is not None:
             try:
-                with _quiet_solver():
-                    out = model.opt_layer(*params, solver_args=model.solve_retry_args)
+                # verbose=True on the retry so ECOS's iteration/residual log is captured for this
+                # (rare, failing) solve; only worth it when a recorder will keep it. _capture_fd
+                # grabs the C-level output (redirect_stdout alone cannot) so it never floods logs.
+                retry_args = model.solve_retry_args
+                if getattr(model, '_recorder', None) is not None:
+                    retry_args = {**retry_args, 'verbose': True}
+                with _capture_fd() as fdlog, _capture_solve_output() as cap:
+                    out = model.opt_layer(*params, solver_args=retry_args)
+                cap['stdout'] += fdlog[0]
                 model._solve_log.append((model._solve_phase, 'retry'))
+                _emit_solve(model, 'retry', cap, read_info=True, exc=strict_exc)
                 return out
-            except Exception:
-                pass
+            except Exception as retry_exc:
+                cap['stdout'] += fdlog[0]                 # the relaxed solve also failed:
+                last_exc, last_cap = retry_exc, cap       # keep its exception + verbose log
         if model.solve_fallback:
             model._solve_log.append((model._solve_phase, 'fallback'))
+            _emit_solve(model, 'fallback', last_cap, read_info=False, exc=last_exc)
             z = torch.full((model.n_y, 1), 1.0 / model.n_y, dtype=torch.double,
                            device=model.pred_layer.weight.device, requires_grad=True)
             return (z,)
@@ -578,6 +683,9 @@ class e2e_net(nn.Module):
         self.solve_fallback = solve_fallback
         self._solve_log = []       # accumulates (phase, 'retry'/'fallback') across windows
         self._solve_phase = None   # set by the caller (calibrate/train/infer) before solving
+        self._solve_window = None  # roll-window index; set by net_roll_test / infer_window
+        self._solve_date = None    # decision date; set per step at inference
+        self._recorder = None      # optional obs.Recorder sink; None => zero-overhead no-op
 
         # Cast all parameters/submodules to double. MUST be after every parameter and
         # submodule exists (gamma/delta/epsilon, pred_layer, opt_layer); calling it at the
@@ -670,6 +778,34 @@ class e2e_net(nn.Module):
 
         return z_star, y_hat
 
+    def _emit_epoch(self, epoch, loss_total, loss_task, loss_pred, grad_norm_pred, grad_norm_robust):
+        """Emit one EpochRecord of learning telemetry to the recorder. No-op without one.
+
+        loss_val is left None here (net_train computes validation loss once, after all epochs);
+        theta_dist_l2 is measured against the OLS warm-start stashed by fit_predictor.
+        """
+        rec = self._recorder
+        if rec is None:
+            return
+        w, b = self.pred_layer.weight.detach(), self.pred_layer.bias.detach()
+        theta_l2 = float((w ** 2).sum() + (b ** 2).sum())
+        theta_dist = None
+        theta_ols = getattr(self, '_ols_theta', None)
+        if theta_ols is not None:
+            theta_dist = float(((w - theta_ols[:, 1:]) ** 2).sum() + ((b - theta_ols[:, 0]) ** 2).sum())
+
+        def _param(name):
+            p = getattr(self, name, None)
+            return float(p.item()) if p is not None else None
+
+        rec.record_epoch(obs.EpochRecord(
+            model=getattr(self, '_name', None), window=getattr(self, '_solve_window', None),
+            epoch=epoch, loss_total=loss_total, loss_task=loss_task, loss_pred=loss_pred,
+            gamma=_param('gamma'), delta=_param('delta'), epsilon=_param('epsilon'),
+            grad_norm_pred=grad_norm_pred, grad_norm_robust=grad_norm_robust,
+            decay_norm=float(self.weight_decay) * (theta_l2 ** 0.5),
+            theta_l2=theta_l2, theta_dist_l2=theta_dist))
+
     #-----------------------------------------------------------------------------------------------
     # net_train: Train the e2e neural net
     #-----------------------------------------------------------------------------------------------
@@ -712,43 +848,62 @@ class e2e_net(nn.Module):
         free_port_params = [p for n, p in self.named_parameters()
                             if n in ('gamma', 'delta') and p.requires_grad]
         groups = [{'params': pred_params, 'lr': lr, 'weight_decay': self.weight_decay}]
+        robust_params = []                       # gamma/delta/epsilon, for per-epoch grad-norm report
         if free_port_params:
             g_lr = self.gamma_lr if self.gamma_lr is not None else lr
             groups.append({'params': free_port_params, 'lr': g_lr, 'weight_decay': 0.0})
+            robust_params += free_port_params
         if hasattr(self, 'epsilon') and self.epsilon.requires_grad:
             eps_lr = self.epsilon_lr if self.epsilon_lr is not None else lr
             groups.append({'params': [self.epsilon], 'lr': eps_lr, 'weight_decay': 0.0})
+            robust_params.append(self.epsilon)
         optimizer = torch.optim.Adam(groups)
 
         # Number of elements in training set
         n_train = len(train_set)
 
         # Train the neural network
+        rec = self._recorder                     # per-epoch telemetry sink (None => no-op)
         for epoch in range(epochs):
-                
+
             # TRAINING: forward + backward pass
-            train_loss = 0
-            optimizer.zero_grad() 
+            train_loss = 0.0
+            task_sum, pred_sum = 0.0, 0.0
+            optimizer.zero_grad()
             for t, (x, y, y_perf) in enumerate(train_set):
                 # GPU MOD: move batch to device
                 x, y, y_perf = x.to(device), y.to(device), y_perf.to(device)
-                
+
                 # Forward pass: predict and optimize
                 z_star, y_hat = self(x.squeeze(), y.squeeze())
 
-                # Loss function
+                # Loss = task loss + optional prediction co-objective. Split into named terms so the
+                # per-epoch report can attribute the two; the combined `loss` graph is identical to
+                # the former inline expression, so training is numerically unchanged.
+                task = self.perf_loss(z_star, y_perf.squeeze())
                 if self.pred_loss is None:
-                    loss = (1/n_train) * self.perf_loss(z_star, y_perf.squeeze())
+                    loss = (1/n_train) * task
+                    pred = None
                 else:
-                    loss = (1/n_train) * (self.perf_loss(z_star, y_perf.squeeze()) + 
-                    (self.pred_loss_factor/self.n_y) * self.pred_loss(y_hat, y_perf.squeeze()[0]))
+                    pred = self.pred_loss(y_hat, y_perf.squeeze()[0])
+                    loss = (1/n_train) * (task + (self.pred_loss_factor/self.n_y) * pred)
 
                 # Backward pass: backpropagation
                 loss.backward()
 
                 # Accumulate loss of the fully trained model
                 train_loss += loss.item()
-        
+                if rec is not None:
+                    task_sum += task.item() / n_train
+                    if pred is not None:
+                        pred_sum += (self.pred_loss_factor/self.n_y) * pred.item() / n_train
+
+            # Gradient norms must be read after backward, before optimizer.step() updates the params.
+            grad_norm_pred = grad_norm_robust = None
+            if rec is not None:
+                grad_norm_pred = _grad_norm(pred_params)
+                grad_norm_robust = _grad_norm(robust_params)
+
             # Update parameters
             optimizer.step()
 
@@ -766,6 +921,11 @@ class e2e_net(nn.Module):
             # already correct, so rebuilding every epoch would be byte-identical wasted work.
             if self.model_type == 'base_rom' and self.pred_layer.weight.requires_grad:
                 self._rebuild_opt_layer()
+
+            # Per-epoch learning telemetry (no-op when no recorder is attached)
+            if rec is not None:
+                self._emit_epoch(epoch, train_loss, task_sum, pred_sum,
+                                 grad_norm_pred, grad_norm_robust)
 
         # Compute and return the validation loss of the model
         if val_set is not None:
@@ -830,6 +990,7 @@ class e2e_net(nn.Module):
             else:
                 self._cov_x_cache = torch.cov(X_train.T).cpu().numpy()
             self._rebuild_opt_layer()
+        self._ols_theta = Theta          # OLS warm-start reference for per-epoch theta_dist_l2
         return Theta
 
     #-----------------------------------------------------------------------------------------------
@@ -960,6 +1121,7 @@ class e2e_net(nn.Module):
         for i in range(n_roll):
 
             print(f"Out-of-sample window: {i+1} / {n_roll}")
+            self._solve_window = i          # tag every solve in this window (report context)
 
             split[0] = init_split[0] + win_size * i
             if i < n_roll-1:
@@ -990,6 +1152,7 @@ class e2e_net(nn.Module):
             test_dev  = DeviceDataLoader(test_set, device)
 
             # Train model using all available data preceding the test window
+            self._solve_phase = 'train'
             self.net_train(train_dev, lr=lr, epochs=epochs)
 
             # Store trained values of gamma, delta, and epsilon
@@ -1010,17 +1173,25 @@ class e2e_net(nn.Module):
                 self.theta_L2.append(theta_L2)
                 self.theta_dist_L2.append(theta_dist_L2)
 
+            self._solve_phase = 'infer'
+            test_dates = Y.test().index[self.n_obs:]
             with torch.no_grad():
                 for j, (x, y, y_perf) in enumerate(test_dev):
                     # Predict and optimize
+                    self._solve_date = test_dates[j] if j < len(test_dates) else None
                     z_star, _ = self(x.squeeze(), y.squeeze())
-                                
+
                     # Store portfolio weights and returns for each time step 't'
                     portfolio.weights[t] = z_star.squeeze().cpu()
-                                        
+
                     # Perform dot product
                     portfolio.rets[t] = y_perf.squeeze().cpu() @ portfolio.weights[t]
                     t += 1
+
+            # Window boundary: let the recorder compute lazy diagnostics for this window (it only
+            # does work if the window saw a retry/fallback). Passes the standardized train slice.
+            if self._recorder is not None:
+                self._recorder.on_window(self, i, test_dates, Xtr, Y.train())
 
 
         # Reset dataset
