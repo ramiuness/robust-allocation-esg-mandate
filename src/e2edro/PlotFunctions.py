@@ -92,14 +92,15 @@ def sr_plot(portfolio_list, names, colors, path=None):
     Output
     SR evolution figure
     """
-    time_period = 104
-    df = pd.concat([portfolio_list[i].rets.rets.rename(names[i]) for i in 
+    pp = getattr(portfolio_list[0], 'periods_per_year', 52)   # freq-aware annualization
+    time_period = 2 * pp                                       # 2-year rolling window
+    df = pd.concat([portfolio_list[i].rets.rets.rename(names[i]) for i in
                         range(len(portfolio_list))], axis=1)
-    mean_df = ((df+1).rolling(time_period).apply(gmean))**52 - 1
+    mean_df = ((df+1).rolling(time_period).apply(gmean))**pp - 1
     mean_df.dropna(inplace=True)
     std_df = df.rolling(time_period).std()
     std_df.dropna(inplace=True)
-    plot_df = mean_df / (std_df * np.sqrt(52))
+    plot_df = mean_df / (std_df * np.sqrt(pp))
 
     fig, ax = plt.subplots(figsize=(6,4))
     for i in range(len(portfolio_list)):
@@ -134,9 +135,10 @@ def sr_bar(portfolio_list, names, colors, path=None):
     df = pd.concat([portfolio_list[i].rets.rets.rename(names[i]) for i in 
                         range(n)], axis=1)
     
+    pp = getattr(portfolio_list[0], 'periods_per_year', 52)   # freq-aware annualization
     mean_df = df.expanding(min_periods=1).mean().groupby([df.index.year]).tail(1)
     std_df  = df.expanding(min_periods=1).std().groupby([df.index.year]).tail(1)
-    plot_df = mean_df / std_df * np.sqrt(52)
+    plot_df = mean_df / std_df * np.sqrt(pp)
 
     x = np.arange(plot_df.shape[0])
     w = 1/n
@@ -226,9 +228,10 @@ def fin_table(portfolios:list, names:list) -> pd.DataFrame:
     invHidxs = []
     
     for portfolio in portfolios:
-        ret = (portfolio.rets.tri.iloc[-1] ** 
-                (1/portfolio.rets.tri.shape[0]))**52 - 1
-        vol = portfolio.vol * np.sqrt(52)
+        pp = getattr(portfolio, 'periods_per_year', 52)   # freq-aware annualization
+        ret = (portfolio.rets.tri.iloc[-1] **
+                (1/portfolio.rets.tri.shape[0]))**pp - 1
+        vol = portfolio.vol * np.sqrt(pp)
         SR = ret / vol
         invHidx = round(1/(pd.DataFrame(portfolio.weights) ** 2).sum(axis=1).mean(), ndigits=2)
         rets.append(round(ret*100, ndigits=1))

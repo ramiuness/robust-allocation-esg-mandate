@@ -57,16 +57,22 @@ class SlidingWindow(Dataset):
 ####################################################################################################
 # Backtest object to store out-of-sample results
 ####################################################################################################
+# Single source of truth for annualization: periods per year by data frequency.
+PERIODS_PER_YEAR = {'daily': 252, 'weekly': 52, 'monthly': 12}
+
+
 class backtest:
     """backtest object
     """
-    def __init__(self, len_test, n_y, dates):
+    def __init__(self, len_test, n_y, dates, periods_per_year=52):
         """Portfolio object. Stores the NN out-of-sample results
 
         Inputs
         len_test: Number of scenarios in the out-of-sample evaluation period
         n_y: Number of assets in the portfolio
         dates: DatetimeIndex
+        periods_per_year: Annualization factor (52 weekly / 252 daily / 12 monthly).
+            Used by stats() so annualized_return is frequency-correct (was hardcoded 52).
 
         Output
         Backtest object with fields:
@@ -85,6 +91,7 @@ class backtest:
         self.weights = np.zeros((len_test, n_y))
         self.rets = np.zeros(len_test)
         self.dates = dates[-len_test:]
+        self.periods_per_year = periods_per_year
 
     def stats(self):
         """Compute and store portfolio statistics.
@@ -98,8 +105,10 @@ class backtest:
         # Compute all metrics while self.rets is still a numpy array
         tri = np.cumprod(self.rets + 1)
 
-        # Mean and volatility
-        self.mean = (tri[-1])**(1/len(tri)) - 1
+        # Mean and volatility. Guard non-positive terminal wealth (reachable with long_short losses
+        # >100%): a fractional power of a non-positive base is nan/complex, so report nan explicitly.
+        final_wealth = tri[-1]
+        self.mean = final_wealth ** (1/len(tri)) - 1 if final_wealth > 0 else np.nan
         self.vol = np.std(self.rets)
 
         # Sharpe ratio
@@ -127,11 +136,12 @@ class backtest:
         eff = [1.0 / np.sum(w**2) for w in self.weights if np.sum(w**2) > 0]
         self.effective_holdings = float(np.mean(eff)) if eff else 0.0
 
-        # Annualized return (CAGR) - assuming weekly data (52 periods/year)
+        # Annualized return (CAGR), frequency-aware via self.periods_per_year (was hardcoded 52).
+        # Same non-positive-wealth guard as mean above.
         n_periods = len(tri)
-        periods_per_year = 52  # weekly data
-        final_wealth = tri[-1]
-        self.annualized_return = float(final_wealth ** (periods_per_year / n_periods) - 1)
+        periods_per_year = self.periods_per_year
+        self.annualized_return = (float(final_wealth ** (periods_per_year / n_periods) - 1)
+                                  if final_wealth > 0 else np.nan)
 
         # Convert rets to DataFrame (must be last - changes self.rets type)
         self.rets = pd.DataFrame({'Date': self.dates, 'rets': self.rets, 'tri': tri})

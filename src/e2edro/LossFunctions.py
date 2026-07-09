@@ -43,9 +43,9 @@ def single_period_over_var_loss(z_star, y_perf):
 def sharpe_loss(z_star, y_perf):
     """Loss function based on the out-of-sample Sharpe ratio
 
-    Compute the out-of-sample Sharpe ratio of the portfolio z_t over the next 12 time steps. The
-    loss is aggregated for all z_t in Z_star and averaged over the number of observations. We use a
-    simplified version of the Sharpe ratio, SR = realized mean / realized std dev.
+    Compute the out-of-sample Sharpe ratio of the portfolio z_t over the performance window
+    (perf_period steps). The loss is aggregated for all z_t in Z_star and averaged over the number
+    of observations. We use a simplified version of the Sharpe ratio, SR = realized mean / std dev.
 
     Inputs
     z_star: Optimal solution. (n_y x 1) tensor of optimal decisions.

@@ -3,19 +3,21 @@ Shared experiment + plotting harness for the ilo-portfolio-allocation notebooks
 (base_rom_demo, esg_experiment_*, esg_alloc_*, e2e_ro_vs_dro_*, esg_diagnostic).
 
 Contents
-- Data loading (load_data) and metrics (portfolio_metrics, build_metrics_table,
-  running_dd).
-- Two plot families: matplotlib (plot_wealth, plot_epsilon_trajectory,
-  plot_weight_heatmap) and Plotly (plot_all_wealth, plot_drawdown,
-  plot_summary_bars). The `_px` names are backward-compat aliases for the Plotly
-  plotters: esg_alloc_1..4 import them as `plot_all_wealth_px as plot_all_wealth`.
+- Data loading (load_data), feature-relation diagnostics (feature_diagnostics,
+  feature_variants, select_best_subset) and metrics (portfolio_metrics,
+  build_metrics_table, running_dd).
+- Plotting: wealth curves and drawdown/summary bars are Plotly (plot_wealth —
+  aliased plot_all_wealth for the all-models overview — plot_drawdown,
+  plot_summary_bars); the single-panel static diagnostics stay matplotlib
+  (plot_epsilon_trajectory, plot_weight_heatmap).
 - Experiment helpers (build_models, calibrate_models, fit_window, infer_window,
-  date_window, run_window, trained_params, model_report) that abstract model-zoo
-  instantiation and the decoupled fit/inference flow out of the notebook cells.
+  date_window, run_window, run_feature_sweep, trained_params, model_report) that
+  abstract model-zoo instantiation and the decoupled fit/inference flow out of the
+  notebook cells.
 
 Import patterns in use: `from base_rom_demo_utils import *` (pulls in np, pd,
-torch, dl + every helper, keeping setup cells short), explicit
-`from base_rom_demo_utils import (...)`, and the `_px`-aliased explicit import.
+torch, dl + every helper, keeping setup cells short) and explicit
+`from base_rom_demo_utils import (...)`.
 """
 import os as _os
 
@@ -27,6 +29,7 @@ import os as _os
 # (see spo-critical-review.md Part II).
 _os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
+import copy
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -40,6 +43,7 @@ import e2edro.BaseModels as bm
 import e2edro.PortfolioClasses as pc
 import e2edro.DataLoad as dl
 from e2edro.e2edro import e2e_net
+from e2edro.progress import track
 
 from run_report import RunReport
 
@@ -149,9 +153,11 @@ __all__ = [
     'set_seeds', 'load_data',
     'build_metrics_table',
     'plot_wealth', 'plot_epsilon_trajectory', 'plot_weight_heatmap',
-    'plot_all_wealth', 'plot_drawdown', 'plot_summary_bars',
+    'plot_all_wealth', 'plot_drawdown', 'plot_summary_bars', 'plot_epsilon_sweep',
     'build_models', 'calibrate_models', 'fit_window', 'infer_window',
-    'date_window', 'run_window', 'trained_params', 'model_report',
+    'date_window', 'run_window', 'run_feature_sweep', 'run_epsilon_sweep',
+    'feature_variants', 'feature_diagnostics', 'select_best_subset', 'cv_score_subset',
+    'trained_params', 'model_report', 'roll_param_trajectory',
     'SOLVER_ARGS', 'solve_report', 'RunReport',
 ]
 
@@ -174,7 +180,7 @@ COLORS = {
 # ---------------------------------------------------------------------------
 def portfolio_metrics(name, p):
     """Return annualised performance metrics for a backtest portfolio object."""
-    ann = np.sqrt(52)
+    ann = np.sqrt(p.periods_per_year)          # frequency-aware annualization (was hardcoded 52)
     ann_vol  = p.vol * ann
     rets_arr = p.rets['rets'].values
     down     = rets_arr[rets_arr < 0]
@@ -188,7 +194,7 @@ def portfolio_metrics(name, p):
         'Sharpe'         : round(sharpe, 3),
         'Sortino'        : round(sortino, 3),
         'Max DD (%)'     : round(p.max_drawdown * 100, 2),
-        'Ann. Turnover'  : round(p.turnover * 52, 2),
+        'Ann. Turnover'  : round(p.turnover * p.periods_per_year, 2),
         'Eff. Holdings'  : round(p.effective_holdings, 2),
     }
 
@@ -221,25 +227,10 @@ def _wealth_anchor(index):
     return index.insert(0, anchor)
 
 
-def plot_wealth(names, portfolios, title, figsize=(11, 5)):
-    """Cumulative wealth curves for a list of (name, portfolio) pairs."""
-    dates = _wealth_anchor(portfolios[0].rets.index)
-    fig, ax = plt.subplots(figsize=figsize)
-    for name, port in zip(names, portfolios):
-        color, ls = COLORS[name]
-        tri = np.concatenate([[1.0], port.rets['tri'].values])
-        ax.plot(dates, tri,
-                color=color, linestyle=ls, linewidth=2, label=name)
-    ax.set_xlabel('Date')
-    ax.set_ylabel('Cumulative Wealth')
-    ax.set_title(title)
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    ax.tick_params(axis='x', rotation=45)
-    plt.tight_layout()
-    plt.show()
-
-
+# plot_wealth (cumulative-wealth curves) is Plotly and lives in the interactive
+# section below. plot_epsilon_trajectory and plot_weight_heatmap stay matplotlib:
+# they are single-panel static diagnostics (a bar chart and an imshow grid), not the
+# shared time-series overlay that benefits from Plotly's hover/legend interactivity.
 def plot_epsilon_trajectory(spo_rom, n_roll, figsize=(8, 4)):
     """Bar chart of learned epsilon per roll window for an SPO-ROM model."""
     windows = list(range(1, n_roll + 1))
@@ -277,16 +268,23 @@ def plot_weight_heatmap(portfolios, asset_labels=None, names=None, ncols=2, figs
     nrows = int(np.ceil(len(names) / ncols))
     fig, axes = plt.subplots(nrows, ncols, figsize=figsize or (7.5 * ncols, 3.2 * nrows),
                              squeeze=False)
+    # A long-only solve (long_short=False) constrains z >= 0 only to ECOS tolerance
+    # (strict ~1e-8/1e-9, relaxed retry 1e-6), so the returned weights carry tiny
+    # negative slack (~ -1e-7) that is not a real short. Gate the diverging colormap
+    # on a tolerance so that slack does not flip the meter into a symmetric ± scale;
+    # sub-tolerance negatives are clipped to 0 and shown on the sequential scale.
+    W_TOL = 1e-6
     for ax, name in zip(axes.flat, names):
         bt = getattr(portfolios[name], 'portfolio', portfolios[name])   # model -> its backtest
         w = np.asarray(bt.weights)
         n_periods, n_y = w.shape
         dates = getattr(bt, 'dates', None)
-        if w.min() < 0:                                        # long-short: diverging at 0
+        if w.min() < -W_TOL:                                   # genuine shorts: diverging at 0
             vmax = np.abs(w).max()
             im = ax.imshow(w.T, aspect='auto', cmap='RdBu_r', vmin=-vmax, vmax=vmax,
                            interpolation='nearest')
         else:                                                  # long-only: sequential from 0
+            w = np.clip(w, 0.0, None)                          # drop sub-tolerance solver slack
             im = ax.imshow(w.T, aspect='auto', cmap='viridis', vmin=0, interpolation='nearest')
         if dates is not None:
             tick = np.linspace(0, n_periods - 1, min(6, n_periods), dtype=int)
@@ -312,11 +310,16 @@ def _dash(ls):
     return 'dash' if ls == '--' else 'solid'
 
 
-def plot_all_wealth(all_names, all_ports):
-    """Interactive cumulative wealth chart (Plotly). Legend placed outside right."""
-    dates = [d.strftime('%Y-%m-%d') for d in _wealth_anchor(all_ports[0].rets.index)]
+def plot_wealth(names, portfolios, title='All Models: Cumulative Wealth'):
+    """Interactive cumulative wealth chart (Plotly). Legend placed outside right.
+
+    The single wealth plotter for the whole notebook — pass any subset of `names`
+    with a custom `title` for paired comparisons, or all eight for the overview.
+    ROM models are drawn thicker so estimation-robust curves stand out.
+    """
+    dates = [d.strftime('%Y-%m-%d') for d in _wealth_anchor(portfolios[0].rets.index)]
     fig = go.Figure()
-    for name, port in zip(all_names, all_ports):
+    for name, port in zip(names, portfolios):
         color, ls = COLORS[name]
         fig.add_trace(go.Scatter(
             x=dates, y=[1.0, *port.rets['tri'].values.tolist()],
@@ -324,7 +327,7 @@ def plot_all_wealth(all_names, all_ports):
             line=dict(color=color, dash=_dash(ls), width=2.5 if 'ROM' in name else 1.8)
         ))
     fig.update_layout(
-        title='All Models: Cumulative Wealth',
+        title=title,
         xaxis_title='Date', yaxis_title='Cumulative Wealth',
         hovermode='x unified',
         legend=dict(x=1.01, y=0.5, xanchor='left', yanchor='middle'),
@@ -332,6 +335,11 @@ def plot_all_wealth(all_names, all_ports):
         height=500
     )
     fig.show()
+
+
+# plot_all_wealth is the historical name for the all-models overview; kept as an
+# alias so the §4/§6 call sites read naturally.
+plot_all_wealth = plot_wealth
 
 
 def plot_drawdown(names, portfolios, title):
@@ -376,12 +384,31 @@ def plot_summary_bars(all_names, all_metrics):
     fig.show()
 
 
-# Backward-compat aliases for the other notebooks that import the `_px` names
-# (e.g. `from base_rom_demo_utils import plot_all_wealth_px`). Kept out of __all__
-# so `import *` stays clean.
-plot_all_wealth_px = plot_all_wealth
-plot_drawdown_px = plot_drawdown
-plot_summary_bars_px = plot_summary_bars
+def plot_epsilon_sweep(sweep, metric='Sharpe', title=None):
+    """Line chart of a metric vs fixed ε, one trace per model (Plotly).
+
+    Reads a run_epsilon_sweep result and overlays the estimation-robust models' ε-curves, so the
+    fixed-B (PO-ROM) and trained-B (SPO-ROM) robustness dials are compared at a glance. ROM curves
+    are drawn thicker, matching plot_wealth. See docs/BASE_ROM_LAYER.md "Long-panel investigation".
+
+    sweep  : DataFrame from run_epsilon_sweep -- MultiIndex (model, epsilon), metric columns.
+    metric : which build_metrics_table column to put on y (default 'Sharpe').
+    """
+    fig = go.Figure()
+    for name in sweep.index.get_level_values('model').unique():
+        sub = sweep.xs(name, level='model')
+        color, ls = COLORS.get(name, ('black', '-'))
+        fig.add_trace(go.Scatter(
+            x=sub.index.tolist(), y=sub[metric].tolist(),
+            mode='lines+markers', name=name,
+            line=dict(color=color, dash=_dash(ls), width=2.5 if 'ROM' in name else 1.8)))
+    fig.update_layout(
+        title=title or f'ε sweep: {metric} vs fixed ε (walk-forward)',
+        xaxis_title='ε (fixed)', yaxis_title=metric,
+        hovermode='x unified',
+        legend=dict(x=1.01, y=0.5, xanchor='left', yanchor='middle'),
+        margin=dict(r=160), height=440)
+    fig.show()
 
 
 # ---------------------------------------------------------------------------
@@ -410,7 +437,7 @@ _SPO_SPECS = [
 def build_models(cfg, n_x, n_y, n_obs, which=None):
     """Instantiate the model zoo and bind cfg to each model.
 
-    cfg     : dict of hyperparameters (seed, epochs, lr, weight_decay, gamma_lr,
+    cfg     : dict of hyperparameters (seed, epochs, lr, weight_decay, dro_lr,
               max_weight, long_short, target_ratio, ...). Stashed as model.cfg.
     n_x     : number of features.
     n_y     : number of assets.
@@ -422,25 +449,35 @@ def build_models(cfg, n_x, n_y, n_obs, which=None):
     # settings + relaxed retry + equal-weight fallback (replaces the old forward monkeypatch).
     _retry = dict(solve_retry_args=_RETRY_ARGS, solve_fallback=True)
 
-    ew = bm.equal_weight(n_x=n_x, n_y=n_y, n_obs=n_obs)
+    # Annualization factor: explicit cfg['periods_per_year'] wins, else derive from cfg['freq'].
+    pp = cfg.get('periods_per_year') or pc.PERIODS_PER_YEAR.get(cfg.get('freq', 'weekly'), 52)
+
+    ew = bm.equal_weight(n_x=n_x, n_y=n_y, n_obs=n_obs, periods_per_year=pp)
     po_m = bm.pred_then_opt(n_x, n_y, n_obs, opt_layer='base_mod',
                             max_weight=cfg['max_weight'], long_short=cfg['long_short'],
+                            periods_per_year=pp,
                             set_seed=cfg['seed'], solver_args=SOLVER_ARGS['base_mod'], **_retry).double()
     po_m._opt_layer = 'base_mod'
     po_rom = bm.pred_then_opt(n_x, n_y, n_obs, opt_layer='base_rom', epsilon=0.5,
                               max_weight=cfg['max_weight'], long_short=cfg['long_short'],
+                              periods_per_year=pp,
                               set_seed=cfg['seed'], solver_args=SOLVER_ARGS['base_rom'], **_retry).double()
     po_rom._opt_layer = 'base_rom'
 
     shared = dict(n_x=n_x, n_y=n_y, n_obs=n_obs, pred_model='linear',
                   epochs=cfg['epochs'], lr=cfg['lr'], weight_decay=cfg['weight_decay'],
                   max_weight=cfg['max_weight'], long_short=cfg['long_short'],
+                  periods_per_year=pp,
                   set_seed=cfg['seed'])
     models = {'EW': ew, 'PO-M': po_m, 'PO-ROM': po_rom}
     for name, spec in _SPO_SPECS:
         kw = dict(spec)
         if kw['opt_layer'] in ('nominal', 'tv', 'hellinger'):
-            kw['gamma_lr'] = cfg['gamma_lr']
+            kw['dro_lr'] = cfg['dro_lr']
+        if kw['opt_layer'] == 'base_rom':
+            # epsilon is passed at instantiation (CV-selected via cfg['epsilon']; default 0.5 to
+            # match PO-ROM). It is frozen -- not gradient-learned -- per e2e_net defaults.
+            kw['epsilon'] = cfg.get('epsilon', 0.5)
         m = e2e_net(**shared, **kw, solver_args=SOLVER_ARGS[kw['opt_layer']], **_retry).double()
         m._opt_layer = kw['opt_layer']
         # _init_state (the in-memory pristine snapshot fit_window resets from) is now created by
@@ -516,9 +553,11 @@ def _stash_fit_attrs(model, X_train_df, Y_train_df, Theta):
     w = model.pred_layer.weight.detach().cpu()
     bb = model.pred_layer.bias.detach().cpu()
     Theta_cpu = Theta.detach().cpu()
-    model.theta_l2_ = float((torch.sum(w ** 2) + torch.sum(bb ** 2)).item())
-    model.theta_dist_l2_ = float((torch.sum((w - Theta_cpu[:, 1:]) ** 2)
-                                  + torch.sum((bb - Theta_cpu[:, 0]) ** 2)).item())
+    # True L2 magnitudes (norm of theta; L2 distance from the OLS warm-start), matching the
+    # per-epoch telemetry in e2e_net._emit_epoch -- the `_l2` name is the norm, not its square.
+    model.theta_l2_ = float(torch.sqrt(torch.sum(w ** 2) + torch.sum(bb ** 2)).item())
+    model.theta_dist_l2_ = float(torch.sqrt(torch.sum((w - Theta_cpu[:, 1:]) ** 2)
+                                            + torch.sum((bb - Theta_cpu[:, 0]) ** 2)).item())
 
 
 def fit_window(model, X_train_df, Y_train_df, *, reset=True):
@@ -590,7 +629,8 @@ def infer_window(model, X_df, Y_df):
             dates.append(Y_df.index[j + n_obs])
 
     dates = pd.DatetimeIndex(dates)
-    port = pc.backtest(len(weights), model.n_y, dates)
+    port = pc.backtest(len(weights), model.n_y, dates,
+                       periods_per_year=getattr(model, 'periods_per_year', 52))
     port.weights = np.asarray(weights)
     port.rets = np.asarray(rets)
     port.dates = dates
@@ -689,6 +729,246 @@ def run_window(models, X, Y, train_end, pred_start=None, pred_end=None, report=T
     return ports
 
 
+def run_feature_sweep(cfg, variants, X_full, Y, *, train_end, pred_start=None,
+                      pred_end=None, which=None, attach_report=True, progress=True):
+    """Single-window ablation over feature subsets of an already-loaded panel.
+
+    For each {label: features} in variants, subset the columns of X_full (no disk
+    re-read) and run the standard single-window cycle on that subset: date_window ->
+    build_models -> calibrate_models -> run_window. The full panel is loaded once by
+    the caller and reused, so the sweep itself parses no data.
+
+    cfg           : hyperparameter dict (as build_models expects).
+    variants      : dict {label: features}; features is a group/name selection understood
+                    by DataLoad (e.g. 'ff5+mom', ['ff5+mom', 'esg'], None for all 12).
+    X_full, Y     : TrainTest objects from load_data with the FULL feature set.
+    train_end     : last training date (inclusive); pred_start / pred_end as in run_window.
+    which         : optional subset of model names to build (default: all eight).
+    attach_report : if True, attach a fresh RunReport to each subset before calibrating,
+                    so its meta / solves / diagnostics are captured.
+    returns       : dict {label: {'X', 'models', 'ports', 'metrics', 'report'}}.
+    """
+    n_obs, n_y = X_full.n_obs, Y.train().shape[1]
+    panel_cols = list(X_full.data.columns)             # resolve against the ACTIVE panel, so a
+    out = {}                                           # non-ESG panel (market) resolves its own names
+    var_bar = track(list(variants.items()), total=len(variants), desc='feature-sweep',
+                    enable=progress)
+    for label, features in var_bar:
+        var_bar.set_postfix(subset=label)
+        cols = dl._resolve_features(features, panel_cols)   # single source of truth for the mapping
+        X = dl.TrainTest(X_full.data[cols], n_obs, X_full.split)   # column subset keeps the row lag
+        Xtr, Ytr, _, _ = date_window(X, Y, train_end, pred_start, pred_end)
+        models = build_models(cfg, len(cols), n_y, n_obs, which)
+        report = RunReport().attach(models) if attach_report else None
+        calibrate_models(models, Xtr, Ytr)             # standardized Xtr matches the fit scale
+        ports = run_window(models, X, Y, train_end, pred_start, pred_end, report=False)
+        metrics = build_metrics_table(list(ports), list(ports.values()))
+        out[label] = {'X': X, 'models': models, 'ports': ports,
+                      'metrics': metrics, 'report': report}
+    return out
+
+
+def run_epsilon_sweep(cfg, X, Y, epsilons, *, n_roll=8, models=('PO-ROM', 'SPO-ROM'),
+                      train_end=None, pred_start=None, pred_end=None, progress=True):
+    """Walk-forward epsilon sweep for the estimation-robust models -- a DIAGNOSTIC ONLY.
+
+    For each (model, eps) it pins eps, calibrates, and backtests walk-forward, so every eps yields
+    the fixed-B (PO-ROM, OLS per window) and trained-B (SPO-ROM, end-to-end per window) curve side
+    by side. Use it to see the SHAPE of the eps->performance response (flat = robust, spiked =
+    fragile), NOT to pick eps: epsilon is selected data-driven by cross-validation
+    (e2e_net.net_cv with an 'epsilon' grid on the training folds). It is NOT gradient-learned --
+    the epsilon gradient is empirically uninformative, so epsilon is frozen during net_train.
+
+    IMPORTANT: if you read this curve to inform an epsilon choice, run it on a window DISJOINT from
+    the reported holdout (pass an earlier train_end / pred bounds), otherwise you are choosing on
+    the period you report -- the same leakage the CV selection avoids.
+
+    cfg        : hyperparameter dict (as build_models expects).
+    X, Y       : TrainTest objects. For rolling, their split defines the walk-forward holdout.
+    epsilons   : iterable of fixed epsilon values to sweep.
+    n_roll     : rolling windows for net_roll_test (the deployment eval, B refreshed per window).
+                 n_roll=None -> one single-window run_window (quick look; a stale B biases the
+                 curve toward higher eps, so it is NOT the deployment case -- needs train_end).
+    models     : which base_rom models to sweep (default both PO-ROM and SPO-ROM).
+    train_end / pred_start / pred_end : single-window bounds (only used when n_roll is None).
+    returns    : DataFrame, MultiIndex (model, epsilon), columns = build_metrics_table metrics.
+    """
+    n_x, n_y, n_obs = X.train().shape[1], Y.train().shape[1], X.n_obs
+    if n_roll is not None:                              # calibrate on the split's initial train
+        Xtr_raw = X.train()                            # window (== roll window 0), standardized on
+        mu, sig = Xtr_raw.mean(), Xtr_raw.std().replace(0.0, 1.0)   # its own stats -- matches the
+        Xtr, Ytr = (Xtr_raw - mu) / sig, Y.train()     # per-window scaling net_roll_test applies
+    elif train_end is not None:
+        Xtr, Ytr, _, _ = date_window(X, Y, train_end, pred_start, pred_end)
+    else:
+        raise ValueError("single-window mode (n_roll=None) needs train_end.")
+
+    rows = {}
+    combos = [(name, v) for name in models for v in epsilons]
+    sweep_bar = track(combos, total=len(combos), desc='ε-sweep', enable=progress)
+    for name, v in sweep_bar:
+        sweep_bar.set_postfix(model=name, eps=v)
+        built = build_models(cfg, n_x, n_y, n_obs, which=[name])
+        m = built[name]
+        if getattr(m, 'model_type', None) != 'base_rom':
+            raise ValueError(f"run_epsilon_sweep: '{name}' is not a base_rom model.")
+        m.epsilon.data.fill_(float(v))                 # pin epsilon (both models read self.epsilon)
+        if isinstance(m, e2e_net):                     # SPO: freeze so training can't move it ...
+            m.epsilon.requires_grad_(False)
+            m._init_state = copy.deepcopy(m.state_dict())   # ... and per-roll resets keep v
+        calibrate_models(built, Xtr, Ytr)              # SPO only; PO has no pred_loss (skipped)
+        if n_roll is not None:
+            m.net_roll_test(X, Y, n_roll=n_roll, progress=progress)
+            port = m.portfolio
+        else:
+            port = run_window(built, X, Y, train_end, pred_start, pred_end, report=False)[name]
+        rows[(name, float(v))] = build_metrics_table([name], [port]).iloc[0]
+
+    out = pd.DataFrame(rows).T
+    out.index.set_names(['model', 'epsilon'], inplace=True)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Feature-relation diagnostics: pick the feature subset the backtest runs on by
+# looking at how the features relate to each other (collinearity) and to the
+# target (signal), then confirming the choice against the ablation sweep.
+# ---------------------------------------------------------------------------
+def feature_variants(X):
+    """Panel-adaptive menu of nested feature subsets for the ablation sweep.
+
+    ESG disk panel -> the semantic groups (FF5+MOM / +Macro / +ESG / All-12).
+    Any other panel (e.g. the 8-factor market panel) -> nested subsets taken from
+    the panel's own column order, so the sweep still runs without ESG group names.
+    For the FF market panel the count breakpoints line up with FF3 / FF5 / FF5+MOM
+    / All; the labels report the feature count to stay honest about arbitrary panels.
+
+    X       : TrainTest with the full feature panel.
+    returns : dict {label: features} understood by run_feature_sweep (a group-name
+              selection for the ESG panel, else an explicit column list per subset).
+    """
+    cols = list(X.data.columns)
+    group_cols = {c for g in dl.FEATURE_GROUPS.values() for c in g}
+    if set(cols) == group_cols:                    # the ESG disk panel: use semantics
+        return {'FF5+MOM': 'ff5+mom',
+                '+Macro':  ['ff5+mom', 'macro'],
+                '+ESG':    ['ff5+mom', 'esg'],
+                'All-12':  None}
+    # Generic panel: nested prefixes at sensible breakpoints (FF3/FF5/FF5+MOM/All
+    # when the columns are the ordered FF factors).
+    n = len(cols)
+    breaks = sorted({k for k in (3, 5, 6, n) if 1 <= k <= n})
+    return {f'{k}-feat': cols[:k] for k in breaks}
+
+
+def _vif(Xz):
+    """Variance Inflation Factor per feature: VIF_i = 1 / (1 - R_i^2), where R_i^2 is from
+    regressing feature i on all the other features.
+
+    Returns np.inf where a feature is (near-)perfectly explained by the rest (a singular
+    correlation block, true VIF -> inf) -- the honest limit, rather than the small pseudo-inverse
+    diagonal that a floored 1/(1-R^2) would mask as "no collinearity". With p features this is p
+    tiny least-squares solves; for a full-rank block it equals the inverse-correlation diagonal.
+    """
+    A = Xz.values
+    n, p = A.shape
+    vifs = []
+    for i in range(p):
+        others = np.column_stack([np.ones(n), np.delete(A, i, axis=1)])   # intercept + the rest
+        beta, *_ = np.linalg.lstsq(others, A[:, i], rcond=None)
+        ss_res = float(((A[:, i] - others @ beta) ** 2).sum())
+        ss_tot = float(((A[:, i] - A[:, i].mean()) ** 2).sum())
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+        vifs.append(np.inf if r2 >= 1 - 1e-10 else 1.0 / (1.0 - r2))
+    return pd.Series(vifs, index=list(Xz.columns))
+
+
+def feature_diagnostics(X, Y, train_end, show=True):
+    """Variable-relation diagnostic on the train slice: feature collinearity.
+
+    Computed on the standardized training window only (via date_window), so there is no
+    look-ahead. `vif` is the Variance Inflation Factor per feature (np.inf when a feature is
+    (near-)perfectly collinear with the others); `max_abs_corr_other` is each feature's strongest
+    pairwise correlation with another feature. Both are redundancy measures (lower = more
+    independent); relevance is owned by the ablation sweep. See docs/DIAGNOSTICS_DEFINITIONS.md.
+
+    X, Y      : TrainTest objects from load_data.
+    train_end : last training date (inclusive) -- the window the diagnostic reads.
+    show      : if True, render the feature-correlation heatmap (Plotly).
+    returns   : DataFrame indexed by feature with columns ['vif', 'max_abs_corr_other'].
+    """
+    Xtr, _, _, _ = date_window(X, Y, train_end=train_end)
+    corr = Xtr.corr()
+    off_diag = corr.where(~np.eye(len(corr), dtype=bool))
+    diag = pd.DataFrame({
+        'vif': _vif(Xtr),
+        'max_abs_corr_other': off_diag.abs().max(),
+    }, index=corr.columns).round(3)
+
+    if show:
+        fig = go.Figure(go.Heatmap(
+            z=corr.values, x=corr.columns.tolist(), y=corr.columns.tolist(),
+            zmin=-1, zmax=1, colorscale='RdBu_r', reversescale=False,
+            colorbar=dict(title='corr')))
+        fig.update_layout(title='Feature correlation (train slice)',
+                          height=480, width=560, yaxis=dict(autorange='reversed'))
+        fig.show()
+    return diag
+
+
+def cv_score_subset(cfg, X_sub, Y, *, n_val=4, which='SPO-Nominal'):
+    """Averaged net_cv validation-fold loss for one feature subset (train-only; no report leak).
+
+    Builds the representative model on the subset and runs net_cv's expanding folds at the current
+    cfg (a 1-point grid, so nothing is swept -- we just read the averaged fold val_loss). net_cv
+    operates on X_sub.train() only, so the report holdout is never touched. Lower is better.
+
+    cfg   : hyperparameter dict (as build_models expects).
+    X_sub : TrainTest whose columns are already the subset (report split preserved).
+    Y     : TrainTest of returns.
+    n_val : number of expanding validation folds.
+    which : representative model name used to score relevance (default SPO-Nominal).
+    """
+    n_x, n_y, n_obs = X_sub.train().shape[1], Y.train().shape[1], X_sub.n_obs
+    m = build_models(cfg, n_x, n_y, n_obs, which=[which])[which]
+    m.net_cv(X_sub, Y, grid={'epochs': [cfg['epochs']]}, n_val=n_val)
+    return float(m.cv_results['val_loss'].iloc[0])
+
+
+def select_best_subset(diag, variants, cfg, X_full, Y, *, n_val=4, vif_threshold=10.0,
+                       which='SPO-Nominal'):
+    """Choose the feature subset for the rolling backtest -- WITHOUT touching the report holdout.
+
+    Prune features the diagnostic flags as collinear (VIF > vif_threshold), then among subsets that
+    use only surviving features pick the one with the best (lowest) net_cv validation-fold loss on
+    the training data (falls back to all subsets if pruning leaves none fully intact). Selection
+    never sees the report period -- that leakage is why the old best-OOS-Sharpe tie-break, which
+    ranked by Sharpe on the reported holdout, was removed.
+
+    diag          : per-feature frame from feature_diagnostics.
+    variants      : dict {label: features} (as run_feature_sweep expects).
+    cfg           : hyperparameter dict.
+    X_full, Y     : TrainTest objects with the FULL feature panel (report split preserved).
+    n_val         : expanding validation folds used to score each subset.
+    vif_threshold : VIF above which a feature is treated as redundant.
+    which         : representative model used to score relevance.
+    returns       : (best_label, best_cols) -- the winning subset's columns.
+    """
+    survivors = set(diag.index[diag['vif'] <= vif_threshold])
+    panel_cols = list(X_full.data.columns)
+    n_obs = X_full.n_obs
+    scored = []
+    for label, features in variants.items():
+        cols = dl._resolve_features(features, panel_cols)
+        X_sub = dl.TrainTest(X_full.data[cols], n_obs, X_full.split)   # column subset keeps row lag
+        val = cv_score_subset(cfg, X_sub, Y, n_val=n_val, which=which)
+        scored.append((label, cols, val, set(cols) <= survivors))
+    pool = [s for s in scored if s[3]] or scored          # prefer prune-surviving subsets
+    best_label, best_cols, _, _ = min(pool, key=lambda s: s[2])   # lowest validation loss
+    best_cols = [c for c in best_cols if c in survivors] or best_cols
+    return best_label, best_cols
+
+
 def trained_params(model):
     """One-row view of a model's learned scalars and prediction-weight norms.
 
@@ -709,9 +989,12 @@ def trained_params(model):
                 return np.nan
 
     plf = getattr(model, 'pred_loss_factor', None)
+    # gamma enters the objective only for the nominal / DRO layers; base_mod / base_rom declare it
+    # but never use it, so report NaN there rather than the inert init draw (see e2edro.base_mod).
+    uses_gamma = getattr(model, 'model_type', None) in ('nom', 'dro')
     return pd.Series({
         'model_type': getattr(model, 'model_type', 'ew'),
-        'gamma': _scalar('gamma'),
+        'gamma': _scalar('gamma') if uses_gamma else np.nan,
         'delta': _scalar('delta'),
         'epsilon': _scalar('epsilon'),
         'pred_loss_factor': float(plf) if isinstance(plf, (int, float)) else np.nan,
@@ -727,3 +1010,40 @@ def model_report(models):
     returns: pd.DataFrame indexed by model name.
     """
     return pd.DataFrame({name: trained_params(m) for name, m in models.items()}).T
+
+
+def roll_param_trajectory(report, names=None):
+    """Per-window learning summary: learned params + all end-of-window diagnostics.
+
+    Rolling analog of model_report (which reports single-window scalars), but drawn from the full
+    per-epoch telemetry in `report.learning()`. For each (model, roll window) it keeps the LAST
+    epoch -- the end-of-training state for that window -- so one row carries the learned robustness
+    params (ε/γ/δ) alongside the complete learning diagnostics (loss_total/task/pred/val, grad-norm
+    pred/robust, decay_norm, theta_l2, theta_dist_l2) and the epoch count. This is the "full
+    picture" per window; the within-window per-epoch dynamics remain in report.learning(). Models
+    with no training telemetry (EW, PO-*) do not appear. See docs/DIAGNOSTICS_DEFINITIONS.md.
+
+    report : RunReport attached to the rolling run (net_roll_test).
+    names  : subset/order of model names; default all trained models, in first-appearance order.
+    returns: tidy DataFrame indexed by (model, window), one row per trained (model, window).
+    """
+    learn = report.learning()
+    if learn.empty:
+        return pd.DataFrame()
+    last = (learn.sort_values('epoch')                      # end-of-training state per window
+                 .groupby(['model', 'window'], as_index=False).last())
+    n_ep = (learn.groupby(['model', 'window']).size()
+                 .rename('n_epochs').reset_index())
+    out = last.merge(n_ep, on=['model', 'window'])
+    cols = ['model', 'window', 'epsilon', 'gamma', 'delta', 'n_epochs',
+            'loss_total', 'loss_task', 'loss_pred', 'loss_val',
+            'grad_norm_pred', 'grad_norm_robust', 'decay_norm', 'theta_l2', 'theta_dist_l2']
+    out = out[[c for c in cols if c in out.columns]]
+
+    if names is None:
+        names = list(dict.fromkeys(learn['model']))         # first-appearance (run) order
+    out = out[out['model'].isin(names)].copy()
+    out['model'] = pd.Categorical(out['model'], categories=names, ordered=True)
+    num = out.select_dtypes('number').columns
+    out[num] = out[num].round(4)
+    return out.sort_values(['model', 'window']).set_index(['model', 'window'])

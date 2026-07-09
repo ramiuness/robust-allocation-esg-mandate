@@ -19,18 +19,21 @@ import yfinance as yf
 ####################################################################################################
 class TrainTest:
     def __init__(self, data, n_obs, split):
-        """Object to hold the training, validation and testing datasets
+        """Object to hold the training and testing datasets
 
         Inputs
         data: pandas dataframe with time series data
         n_obs: Number of observations per batch
-        split: list of ratios that control the partition of data into training, testing and 
-        validation sets. 
-    
+        split: 2-element list [train_frac, test_frac] partitioning the data. (Validation is not a
+        TrainTest concept -- net_cv carves its own expanding folds from the training portion.)
+
         Output. TrainTest object with fields and functions:
         data: Field. Holds the original pandas dataframe
         train(): Function. Returns a pandas dataframe with the training subset of observations
         """
+        if len(split) != 2:
+            raise ValueError(f"TrainTest expects a 2-element [train, test] split, got {split}. "
+                             "Validation folds are built by net_cv from the training portion.")
         self.data = data
         self.n_obs = n_obs
         self.split = split
@@ -40,8 +43,10 @@ class TrainTest:
         self.numel = [round(i) for i in numel]
 
     def split_update(self, split):
-        """Update the list outlining the split ratio of training, validation and testing
+        """Update the 2-element [train, test] split ratio
         """
+        if len(split) != 2:
+            raise ValueError(f"TrainTest expects a 2-element [train, test] split, got {split}.")
         self.split = split
         n_obs_tot = self.data.shape[0]
         numel = n_obs_tot * np.cumsum(split)
@@ -528,9 +533,13 @@ def fetch_market_data(start:str, end:str, split:list, freq:str='weekly', n_obs:i
         if n_y is not None:
             tick_list = tick_list[:n_y]
 
-        # Download asset data (increased timeout for large historical downloads)
-        data = yf.download(tick_list, start='1999-1-1', end=end, ignore_tz=True, timeout=60)
-        Y = data['Close']        
+        # Download asset data (increased timeout for large historical downloads). auto_adjust=True
+        # is set explicitly so 'Close' is split/dividend-adjusted regardless of the yfinance default
+        # (older versions default to False, which would give unadjusted, wrong returns). Note: the
+        # disk loader (fetch_data_from_disk) uses 'Adj Close' from CSV; that is the primary loader.
+        data = yf.download(tick_list, start='1999-1-1', end=end, ignore_tz=True, timeout=60,
+                           auto_adjust=True)
+        Y = data['Close']
         Y = Y.pct_change().dropna(axis=0)
         Y = Y[start:end]
         #Y.columns = tick_list
@@ -639,8 +648,8 @@ def fetch_data_from_disk(start: str, end: str, split: list, freq: str = 'weekly'
 
     Reads S&P 500 returns from sp_meta.csv, Fama-French 6 factors from
     factor_panel_long.csv, 5 macro innovations from macro_panel_daily_long.csv,
-    and an ESG factor from esg_factor.csv. The effective date range is clamped
-    to the data availability window (~2020-01-02 to 2025-12-31).
+    and an ESG factor from esg_factor.csv. The requested [start, end] range is
+    clamped to the actual data availability via pandas slicing (no hardcoded window).
 
     Features (X, 12 total):
         FF6  — MKT, SMB, HML, RMW, CMA, MOM
@@ -691,9 +700,10 @@ def fetch_data_from_disk(start: str, end: str, split: list, freq: str = 'weekly'
     Y : TrainTest
         Asset return data split into train and test subsets.
     """
-    overlap_start, overlap_end = '2020-01-02', '2025-12-31'
-    effective_start = max(overlap_start, start)
-    effective_end   = min(overlap_end, end)
+    # Clamp the requested window to actual data availability via pandas .loc slicing (used below),
+    # not a hardcoded coverage window: extending the CSVs (e.g. past 2025) is then picked up
+    # automatically instead of being silently truncated by a stale constant.
+    effective_start, effective_end = start, end
 
     if use_cache:
         X = pd.read_pickle('./cache/disk_factor_' + freq + '.pkl')

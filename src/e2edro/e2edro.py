@@ -6,6 +6,7 @@
 import os
 import sys
 import copy
+import itertools
 import io
 import tempfile
 import ctypes
@@ -32,6 +33,7 @@ import e2edro.LossFunctions as lf
 import e2edro.PortfolioClasses as pc
 import e2edro.DataLoad as dl
 import e2edro.observability as obs
+from e2edro.progress import track
 
 import psutil
 num_cores = psutil.cpu_count()
@@ -531,7 +533,7 @@ class e2e_net(nn.Module):
     """End-to-end DRO learning neural net module.
     """
     def __init__(self, n_x, n_y, n_obs, opt_layer='nominal', prisk='p_var', perf_loss='sharpe_loss',
-                pred_model='linear', pred_loss_factor=0.5, perf_period=13, train_pred=True, train_gamma=True, train_delta=True, train_epsilon=True, set_seed=42, epochs=10, lr=1e-3, epsilon_lr=None, weight_decay=0.0, gamma_lr=None, long_short=False, cache_path='./cache/', max_weight=1.0, solver_args=None, solve_retry_args=None, solve_fallback=False):
+                pred_model='linear', pred_loss_factor=0.5, perf_period=13, train_pred=True, train_gamma=True, train_delta=True, train_epsilon=False, epsilon=None, set_seed=42, epochs=10, lr=1e-3, epsilon_lr=None, weight_decay=0.0, dro_lr=None, long_short=False, periods_per_year=52, cache_path='./cache/', max_weight=1.0, solver_args=None, solve_retry_args=None, solve_fallback=False):
         """End-to-end learning neural net module
 
         This NN module implements a linear prediction layer 'pred_layer' and a DRO layer 
@@ -584,8 +586,9 @@ class e2e_net(nn.Module):
         self.lr = lr  #it seems that i have to add it there is a call to self.lr in train_net()
         self.epsilon_lr = epsilon_lr  # Separate learning rate for epsilon (if None, uses lr)
         self.weight_decay = weight_decay  # L2 regularization on prediction weights only
-        self.gamma_lr = gamma_lr          # Separate learning rate for gamma/delta (portfolio params)
+        self.dro_lr = dro_lr              # Learning rate for the portfolio params gamma/delta (nominal + DRO)
         self.long_short = long_short      # Allow short positions if True
+        self.periods_per_year = periods_per_year  # annualization factor (freq-aware; see backtest)
 
         # Store prisk for layer rebuild capability (used by base_rom)
         self.prisk_func = eval('rf.'+prisk)
@@ -620,7 +623,14 @@ class e2e_net(nn.Module):
                     "Sigma_mu_hat = B Cov(x) B^T is only defined for a single factor-loading matrix B."
                 )
             self.gamma.requires_grad = False
-            self.epsilon = nn.Parameter(torch.empty(1).uniform_(0.1, 1.0, generator=gen))
+            # epsilon is a data-driven hyperparameter selected by cross-validation (net_cv), NOT
+            # learned by gradient (empirically the epsilon gradient is uninformative). Pass an
+            # explicit value at construction (via cfg['epsilon'] -> build_models) to pin it; else it
+            # is drawn randomly. train_epsilon defaults to False so net_train learns only B.
+            if epsilon is not None:
+                self.epsilon = nn.Parameter(torch.tensor([float(epsilon)]))
+            else:
+                self.epsilon = nn.Parameter(torch.empty(1).uniform_(0.1, 1.0, generator=gen))
             self.epsilon.requires_grad = train_epsilon
             self.epsilon_init = self.epsilon.item()
             self.model_type = 'base_rom'
@@ -634,6 +644,9 @@ class e2e_net(nn.Module):
                 lb = (1 - 1/n_obs) / 10
             self.delta = nn.Parameter(torch.empty(1).uniform_(lb, ub, generator=gen))
             self.delta.requires_grad = train_delta
+            # Valid ambiguity-radius range (function of n_obs only, not the return values). net_train
+            # caps delta here so it cannot drift above ub (which the task-loss gradient otherwise does).
+            self.delta_lb, self.delta_ub = lb, ub
             self.delta_init = self.delta.item()
             self.model_type = 'dro'
 
@@ -711,21 +724,31 @@ class e2e_net(nn.Module):
         Runs one no-grad forward pass on the training data, then updates self.pred_loss_factor.
         Returns the calibrated value (or None if pred_loss is disabled).
 
-        target_ratio: fraction of the performance loss magnitude assigned to the prediction
-            term at initialization. E.g. 0.5 means prediction loss gets half the gradient
-            weight of the task loss at the start of training.
+        This balances the two terms' LOSS-VALUE magnitudes, not their gradient magnitudes: at the
+        OLS init the prediction loss sits at (near) its own minimum, where its gradient ~ 0, so a
+        gradient-ratio calibration would be degenerate. In effect the prediction term acts as a
+        regularizer anchoring B near the OLS fit (cf. theta_dist_l2), and pred_loss_factor sizes
+        that anchor. See docs/DIAGNOSTICS_DEFINITIONS.md.
+
+        target_ratio: fraction of the performance-loss magnitude assigned to the prediction term at
+            initialization. E.g. 0.5 means the prediction term contributes half the loss-value
+            magnitude of the task loss at the start of training.
         """
         if self.pred_loss is None:
             return None
         loader = DataLoader(pc.SlidingWindow(X_train, Y_train, self.n_obs, self.perf_period))
+        was_training = self.training
         self.eval()
-        with torch.no_grad():
-            x, y, y_perf = next(iter(loader))
-            z_star, y_hat = self(x.squeeze(), y.squeeze())
-            perf_l = abs(self.perf_loss(z_star, y_perf.squeeze()).item())
-            pred_l = abs(self.pred_loss(y_hat, y_perf.squeeze()[0]).item()) / self.n_y
-        if pred_l > 0:
-            self.pred_loss_factor = target_ratio * perf_l / pred_l
+        try:
+            with torch.no_grad():
+                x, y, y_perf = next(iter(loader))
+                z_star, y_hat = self(x.squeeze(), y.squeeze())
+                perf_l = abs(self.perf_loss(z_star, y_perf.squeeze()).item())
+                pred_l = abs(self.pred_loss(y_hat, y_perf.squeeze()[0]).item()) / self.n_y
+            if pred_l > 0:
+                self.pred_loss_factor = target_ratio * perf_l / pred_l
+        finally:
+            self.train(was_training)     # restore the prior mode (don't strand the model in eval)
         return self.pred_loss_factor
 
     #-----------------------------------------------------------------------------------------------
@@ -751,14 +774,12 @@ class e2e_net(nn.Module):
         """
         # Multiple predictions Y_hat from X
         Y_hat = torch.stack([self.pred_layer(x_t) for x_t in X])
-        
-        # Calculate residuals and process them
-        if Y.shape[0] == Y_hat.shape[0]: # I had to add this step to get e2e_net to output! Better if revised!
-            ep = Y - Y_hat
-            y_hat = Y_hat[-1]
-        else:
-            ep = Y - Y_hat[:-1]
-            y_hat = Y_hat[-1]
+
+        # SlidingWindow always yields x with n_obs+1 rows and y with n_obs, so Y_hat[:-1] are the
+        # residual scenarios and Y_hat[-1] is the decision-time prediction (from x_t = X[-1]).
+        # Matches pred_then_opt.forward.
+        ep = Y - Y_hat[:-1]
+        y_hat = Y_hat[-1]
 
         # Optimize z per scenario via the owned robust-solve strategy (self.solver_args, with
         # optional retry/fallback). Determine whether nominal, dro, base_mod or base_rom model.
@@ -781,29 +802,34 @@ class e2e_net(nn.Module):
     def _emit_epoch(self, epoch, loss_total, loss_task, loss_pred, grad_norm_pred, grad_norm_robust):
         """Emit one EpochRecord of learning telemetry to the recorder. No-op without one.
 
-        loss_val is left None here (net_train computes validation loss once, after all epochs);
-        theta_dist_l2 is measured against the OLS warm-start stashed by fit_predictor.
+        loss_val is left None here (net_train computes validation loss once, after all epochs).
+        theta_l2 / theta_dist_l2 are true L2 magnitudes: the L2 norm of the prediction weights,
+        and the L2 distance from the OLS warm-start stashed by fit_predictor. gamma is emitted only
+        for layers that use it (nominal / DRO); base_mod / base_rom report None, since gamma never
+        enters their objective (it would otherwise show the inert init draw).
         """
         rec = self._recorder
         if rec is None:
             return
         w, b = self.pred_layer.weight.detach(), self.pred_layer.bias.detach()
-        theta_l2 = float((w ** 2).sum() + (b ** 2).sum())
+        theta_l2 = float(((w ** 2).sum() + (b ** 2).sum()) ** 0.5)
         theta_dist = None
         theta_ols = getattr(self, '_ols_theta', None)
         if theta_ols is not None:
-            theta_dist = float(((w - theta_ols[:, 1:]) ** 2).sum() + ((b - theta_ols[:, 0]) ** 2).sum())
+            theta_dist = float((((w - theta_ols[:, 1:]) ** 2).sum()
+                                + ((b - theta_ols[:, 0]) ** 2).sum()) ** 0.5)
 
         def _param(name):
             p = getattr(self, name, None)
             return float(p.item()) if p is not None else None
 
+        gamma = _param('gamma') if self.model_type in ('nom', 'dro') else None
         rec.record_epoch(obs.EpochRecord(
             model=getattr(self, '_name', None), window=getattr(self, '_solve_window', None),
             epoch=epoch, loss_total=loss_total, loss_task=loss_task, loss_pred=loss_pred,
-            gamma=_param('gamma'), delta=_param('delta'), epsilon=_param('epsilon'),
+            gamma=gamma, delta=_param('delta'), epsilon=_param('epsilon'),
             grad_norm_pred=grad_norm_pred, grad_norm_robust=grad_norm_robust,
-            decay_norm=float(self.weight_decay) * (theta_l2 ** 0.5),
+            decay_norm=float(self.weight_decay) * theta_l2,
             theta_l2=theta_l2, theta_dist_l2=theta_dist))
 
     #-----------------------------------------------------------------------------------------------
@@ -850,7 +876,7 @@ class e2e_net(nn.Module):
         groups = [{'params': pred_params, 'lr': lr, 'weight_decay': self.weight_decay}]
         robust_params = []                       # gamma/delta/epsilon, for per-epoch grad-norm report
         if free_port_params:
-            g_lr = self.gamma_lr if self.gamma_lr is not None else lr
+            g_lr = self.dro_lr if self.dro_lr is not None else lr
             groups.append({'params': free_port_params, 'lr': g_lr, 'weight_decay': 0.0})
             robust_params += free_port_params
         if hasattr(self, 'epsilon') and self.epsilon.requires_grad:
@@ -902,17 +928,21 @@ class e2e_net(nn.Module):
             grad_norm_pred = grad_norm_robust = None
             if rec is not None:
                 grad_norm_pred = _grad_norm(pred_params)
-                grad_norm_robust = _grad_norm(robust_params)
+                # None (not 0.0) when the layer has no learnable robustness param (base_mod),
+                # so the column reads as "not applicable" rather than a measured zero.
+                grad_norm_robust = _grad_norm(robust_params) if robust_params else None
 
             # Update parameters
             optimizer.step()
 
-            # Ensure that gamma, delta, epsilon > 0 after taking a descent step
+            # Keep the portfolio params in range after a descent step: gamma/epsilon > 0, and delta
+            # inside its valid ambiguity range [delta_lb, delta_ub] (was only clamped > 0, which let
+            # it overshoot the ceiling and overfit -- see the dro_lr instability finding).
             for name, param in self.named_parameters():
                 if name == 'gamma':
                     param.data.clamp_(0.0001)
                 if name == 'delta':
-                    param.data.clamp_(0.0001)
+                    param.data.clamp_(self.delta_lb, self.delta_ub)
                 if name == 'epsilon':
                     param.data.clamp_(0.0001)
 
@@ -996,86 +1026,138 @@ class e2e_net(nn.Module):
     #-----------------------------------------------------------------------------------------------
     # net_cv: Cross validation of the e2e neural net for hyperparameter tuning
     #-----------------------------------------------------------------------------------------------
-    def net_cv(self, X, Y, lr_list, epoch_list, n_val=4):
-        """Neural net cross-validation module
+    # Hyperparameters reachable by reset-to-_init_state + retrain (no CvxpyLayer recompile), so
+    # net_cv can sweep them. Everything else (n_obs, max_weight, long_short, opt_layer, pred_model,
+    # n_x, n_y) is STRUCTURAL -- it changes the compiled problem and must be varied via build_models.
+    # 'epsilon' is a base_rom VALUE knob (pinned + frozen per fold); the rest are net_train args /
+    # optimizer attributes. All are reachable without recompiling the optimization layer.
+    _CV_KNOBS = frozenset({'lr', 'epochs', 'target_ratio', 'weight_decay', 'dro_lr', 'epsilon_lr',
+                           'epsilon'})
+
+    def net_cv(self, X, Y, grid=None, n_val=4, lr_list=None, epoch_list=None, progress=True):
+        """Neural net cross-validation over a configurable hyperparameter grid.
 
         Inputs
-        X: Features. TrainTest object of feature timeseries data
-        Y: Realizations. TrainTest object of asset time series data
-        epochs: number of training passes
-        lr_list: List of candidate learning rates
-        epoch_list: List of candidate number of epochs
-        n_val: Number of validation folds from the training dataset
-        
+        X, Y: TrainTest objects of feature / asset timeseries data.
+        grid: dict {knob: [candidate values]}. Only the knobs present are swept (over their
+            Cartesian product); anything omitted stays at the model's current value. Allowed knobs
+            are the ones reachable without recompiling the optimization layer -- see _CV_KNOBS:
+            'lr'/'epochs' (net_train args), 'weight_decay'/'dro_lr'/'epsilon_lr' (optimizer
+            attributes read by net_train), and 'target_ratio' (re-calibrates pred_loss_factor at
+            each fold's OLS init). A structural key raises, redirecting to build_models.
+        n_val: Number of expanding-window validation folds per candidate.
+        lr_list, epoch_list: back-compat shorthand; when grid is None,
+            grid = {'lr': lr_list, 'epochs': epoch_list}.
+
         Output
-        Trained model
+        Trained model with self.cv_results (one row per grid combo: the swept knobs + val_loss) and
+        the winning combo's knobs set on self.
         """
-        results = pc.CrossVal()
+        if grid is None:
+            grid = {'lr': lr_list, 'epochs': epoch_list}
+        grid = {k: v for k, v in grid.items() if v is not None}
+        bad = set(grid) - self._CV_KNOBS
+        if bad:
+            raise ValueError(
+                f"net_cv cannot tune {sorted(bad)}: these are structural (they change the compiled "
+                f"problem). Tunable knobs: {sorted(self._CV_KNOBS)}. Vary structural params (n_obs, "
+                f"max_weight, long_short, opt_layer, ...) by rebuilding the model instead."
+            )
+        if not grid:
+            raise ValueError("net_cv: empty grid -- pass at least one knob to sweep.")
+        if 'epsilon' in grid and not hasattr(self, 'epsilon'):
+            raise ValueError("net_cv: 'epsilon' is only tunable for base_rom models.")
+
+        names = list(grid)
         X_temp = dl.TrainTest(X.train(), X.n_obs, [1, 0])
         Y_temp = dl.TrainTest(Y.train(), Y.n_obs, [1, 0])
-        for epochs in epoch_list:
-            for lr in lr_list:
-                
-                # Train the neural network
-                print('================================================')
-                print(f"Training E2E {self.model_type} model: lr={lr}, epochs={epochs}")
-                
-                val_loss_tot = []
-                for i in range(n_val-1,-1,-1):
+        rows = []
+        combos = list(itertools.product(*(grid[k] for k in names)))
+        combo_bar = track(combos, total=len(combos), desc=f'CV {self.model_type}',
+                          enable=progress, leave=False)
+        for combo in combo_bar:
+            cfg = dict(zip(names, combo))
+            combo_bar.set_postfix(**{k: (round(v, 4) if isinstance(v, float) else v)
+                                     for k, v in cfg.items()})
 
-                    # Partition training dataset into training and validation subset
-                    split = [round(1-0.2*(i+1),2), 0.2]
-                    X_temp.split_update(split)
-                    Y_temp.split_update(split)
+            val_loss_tot = []
+            fold_bar = track(range(n_val-1, -1, -1), total=n_val, desc='  folds',
+                             enable=progress, leave=False)
+            for i in fold_bar:
 
-                    # Re-fit feature standardization on this fold's train window, apply to its val window.
-                    mu = X_temp.train().mean()
-                    sigma = X_temp.train().std().replace(0.0, 1.0)
-                    Xtr, Xval = (X_temp.train() - mu) / sigma, (X_temp.test() - mu) / sigma
+                # Partition training dataset into training and validation subset
+                split = [round(1-0.2*(i+1), 2), 0.2]
+                X_temp.split_update(split)
+                Y_temp.split_update(split)
 
-                    # Construct training and validation DataLoader objects
-                    train_set = DataLoader(pc.SlidingWindow(Xtr, Y_temp.train(),
-                                                            self.n_obs, self.perf_period))
-                    val_set = DataLoader(pc.SlidingWindow(Xval, Y_temp.test(),
-                                                            self.n_obs, self.perf_period))
+                # Re-fit feature standardization on this fold's train window, apply to its val window.
+                mu = X_temp.train().mean()
+                sigma = X_temp.train().std().replace(0.0, 1.0)
+                Xtr, Xval = (X_temp.train() - mu) / sigma, (X_temp.test() - mu) / sigma
 
-                    # Reset learnable parameters gamma and delta
-                    self.load_state_dict(self._init_state)
+                # Construct training and validation DataLoader objects
+                train_set = DataLoader(pc.SlidingWindow(Xtr, Y_temp.train(),
+                                                        self.n_obs, self.perf_period))
+                val_set = DataLoader(pc.SlidingWindow(Xval, Y_temp.test(),
+                                                        self.n_obs, self.perf_period))
 
-                    # OLS warm-start + (base_rom) Sigma_mu_hat build, in one call
-                    if self.pred_model == 'linear':
-                        self.fit_predictor(Xtr, Y_temp.train())
+                # Reset learnable params to the common init, then apply this combo's optimizer-
+                # attribute knobs (net_train reads self.weight_decay/dro_lr/epsilon_lr).
+                self.load_state_dict(self._init_state)
+                for k in ('weight_decay', 'dro_lr', 'epsilon_lr'):
+                    if k in cfg:
+                        setattr(self, k, cfg[k])
+                # epsilon is a VALUE knob (base_rom): pin it into the Parameter and freeze the
+                # gradient for this fold, so net_train learns only B against the fixed epsilon
+                # (its gradient is uninformative). Non-structural -- no opt_layer recompile needed.
+                if 'epsilon' in cfg:
+                    self.epsilon.data.fill_(float(cfg['epsilon']))
+                    self.epsilon.requires_grad_(False)
 
-                    val_loss = self.net_train(train_set, val_set=val_set, lr=lr, epochs=epochs)
-                    val_loss_tot.append(val_loss)
+                # OLS warm-start + (base_rom) Sigma_mu_hat build, in one call
+                if self.pred_model == 'linear':
+                    self.fit_predictor(Xtr, Y_temp.train())
 
-                    print(f"Fold: {n_val-i} / {n_val}, val_loss: {val_loss}")
+                # target_ratio takes effect by re-calibrating pred_loss_factor -- must FOLLOW the
+                # OLS init (calibration reads the OLS-fitted predictor).
+                if 'target_ratio' in cfg:
+                    self.calibrate_pred_loss_factor(Xtr, Y_temp.train(), cfg['target_ratio'])
 
-                # Store results
-                results.val_loss.append(np.mean(val_loss_tot))
-                results.lr.append(lr)
-                results.epochs.append(epochs)
-                print('================================================')
+                val_loss = self.net_train(train_set, val_set=val_set,
+                                          lr=cfg.get('lr', self.lr),
+                                          epochs=cfg.get('epochs', self.epochs))
+                val_loss_tot.append(val_loss)
+                fold_bar.set_postfix(fold=f'{n_val-i}/{n_val}', val_loss=round(val_loss, 4))
 
-        # Convert results to dataframe. Disambiguate the pickle by opt_layer + pred_model + seed
-        # so tv/hellinger (both model_type='dro') and different-seed runs never collide.
-        self.cv_results = results.df()
+            rows.append({**cfg, 'val_loss': np.mean(val_loss_tot)})
+
+        # Results dataframe: one column per swept knob + val_loss. Disambiguate the pickle by
+        # opt_layer + pred_model + seed so tv/hellinger (both model_type='dro') and different-seed
+        # runs never collide.
+        self.cv_results = pd.DataFrame(rows)
         cv_path = f"{self.cache_path}cv_{self.opt_layer_name}_{self.pred_model}_seed{self.seed}.pkl"
         os.makedirs(os.path.dirname(cv_path) or '.', exist_ok=True)
         self.cv_results.to_pickle(cv_path)
 
-        # Select and store the optimal hyperparameters
-        idx = self.cv_results.val_loss.idxmin()
-        self.lr = self.cv_results.lr[idx]
-        self.epochs = self.cv_results.epochs[idx]
-
-        # Print optimal parameters
-        print(f"CV E2E {self.model_type} with hyperparameters: lr={self.lr}, epochs={self.epochs}")
+        # Select the best combo and set the winning knobs on self. lr/epochs/weight_decay/dro_lr/
+        # epsilon_lr propagate to the next training directly; target_ratio is recorded but only
+        # re-takes effect through a subsequent calibrate_pred_loss_factor call.
+        best = self.cv_results.loc[self.cv_results.val_loss.idxmin()]
+        for k in names:
+            if k == 'epsilon':
+                # pin the winning epsilon INTO the Parameter (not setattr a float over it) and
+                # freeze it, so the deployed model uses the CV-selected value.
+                self.epsilon.data.fill_(float(best[k]))
+                self.epsilon.requires_grad_(False)
+            else:
+                setattr(self, k, best[k])
+        print(f"CV E2E {self.model_type} optimal: "
+              + ', '.join(f'{k}={best[k]}' for k in names))
 
     #-----------------------------------------------------------------------------------------------
     # net_roll_test: Test the e2e neural net
     #-----------------------------------------------------------------------------------------------
-    def net_roll_test(self, X, Y, n_roll=4, lr=None, epochs=None):
+    def net_roll_test(self, X, Y, n_roll=4, lr=None, epochs=None, progress=True):
         """Neural net rolling window out-of-sample test
 
         Inputs
@@ -1092,9 +1174,6 @@ class e2e_net(nn.Module):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.to(device)
 
-        # Declare backtest object to hold the test results
-        portfolio = pc.backtest(len(Y.test())-Y.n_obs, self.n_y, Y.test().index[Y.n_obs:])
-
         # Store trained gamma, delta, and epsilon values
         if self.model_type == 'nom':
             self.gamma_trained = []
@@ -1104,49 +1183,49 @@ class e2e_net(nn.Module):
         elif self.model_type == 'base_rom':
             self.epsilon_trained = []
 
-        # Store the squared L2-norm of the prediction weights and their difference from OLS weights
-        if self.pred_model == 'linear':
-            self.theta_L2 = []
-            self.theta_dist_L2 = []
+        # Roll boundaries as absolute integer positions from the split. The portfolio is sized from
+        # the SAME edges that drive the fills (allocation == fills by construction), and X/Y are
+        # sliced with .iloc -- never mutating the passed TrainTest and never assuming the split sums
+        # to 1 (a partial split simply yields edges[-1] < len(data) and the rolls stop there).
+        n_obs = self.n_obs
+        N = len(Y.data)
+        train_frac, test_frac = Y.split
+        edges = [round(N * (train_frac + test_frac * k / n_roll)) for k in range(n_roll + 1)]
+        if edges[0] < n_obs:
+            raise ValueError(
+                f"Insufficient training data: first-roll train window ends at position "
+                f"{edges[0]} < n_obs={n_obs}. Use a larger train fraction or a smaller n_obs."
+            )
 
-        # Store initial train/test split
-        init_split = Y.split
-
-        # Window size
-        win_size = init_split[1] / n_roll
-
-        split = [0, 0]
+        portfolio = pc.backtest(edges[-1] - edges[0], self.n_y, Y.data.index[edges[0]:edges[-1]],
+                                periods_per_year=self.periods_per_year)
         t = 0
 
-        for i in range(n_roll):
-
-            print(f"Out-of-sample window: {i+1} / {n_roll}")
+        rolls = track(range(n_roll), total=n_roll, desc=f'{getattr(self, "_name", "SPO")} roll',
+                      enable=progress, leave=False)
+        for i in rolls:
             self._solve_window = i          # tag every solve in this window (report context)
+            rolls.set_postfix(window=f'{i+1}/{n_roll}')
 
-            split[0] = init_split[0] + win_size * i
-            if i < n_roll-1:
-                split[1] = win_size
-            else:
-                split[1] = 1 - split[0]
-
-            X.split_update(split), Y.split_update(split)
+            Xtr_df = X.data.iloc[:edges[i]]
+            Ytr_df = Y.data.iloc[:edges[i]]
+            Xte_df = X.data.iloc[edges[i] - n_obs:edges[i + 1]]   # +n_obs lookback for the window
+            Yte_df = Y.data.iloc[edges[i] - n_obs:edges[i + 1]]
 
             # Re-fit feature standardization on this roll's train window, apply to its test window.
-            mu = X.train().mean()
-            sigma = X.train().std().replace(0.0, 1.0)
-            Xtr, Xte = (X.train() - mu) / sigma, (X.test() - mu) / sigma
+            mu = Xtr_df.mean()
+            sigma = Xtr_df.std().replace(0.0, 1.0)
+            Xtr, Xte = (Xtr_df - mu) / sigma, (Xte_df - mu) / sigma
 
-            train_set = DataLoader(pc.SlidingWindow(Xtr, Y.train(), self.n_obs, self.perf_period))
-            test_set = DataLoader(pc.SlidingWindow(Xte, Y.test(), self.n_obs, 1))
+            train_set = DataLoader(pc.SlidingWindow(Xtr, Ytr_df, n_obs, self.perf_period))
+            test_set = DataLoader(pc.SlidingWindow(Xte, Yte_df, n_obs, 1))
 
-            # Reset learnable parameters gamma and delta
+            # Reset learnable parameters to the pristine init
             self.load_state_dict(self._init_state)
 
-            # OLS warm-start + (base_rom) Sigma_mu_hat build, in one call. Theta is kept for the
-            # theta_dist_L2 bookkeeping below.
-            Theta = None
+            # OLS warm-start + (base_rom) Sigma_mu_hat build, in one call.
             if self.pred_model == 'linear':
-                Theta = self.fit_predictor(Xtr, Y.train())
+                self.fit_predictor(Xtr, Ytr_df)
 
             train_dev = DeviceDataLoader(train_set, device)
             test_dev  = DeviceDataLoader(test_set, device)
@@ -1164,17 +1243,8 @@ class e2e_net(nn.Module):
             elif self.model_type == 'base_rom':
                 self.epsilon_trained.append(self.epsilon.item())
 
-            # Store the squared L2 norm of theta and distance between theta and OLS weights
-            if self.pred_model == 'linear':
-                theta_L2 = (torch.sum(self.pred_layer.weight**2, axis=()) + 
-                            torch.sum(self.pred_layer.bias**2, axis=()))
-                theta_dist_L2 = (torch.sum((self.pred_layer.weight - Theta[:,1:])**2, axis=()) + 
-                                torch.sum((self.pred_layer.bias - Theta[:,0])**2, axis=()))
-                self.theta_L2.append(theta_L2)
-                self.theta_dist_L2.append(theta_dist_L2)
-
             self._solve_phase = 'infer'
-            test_dates = Y.test().index[self.n_obs:]
+            test_dates = Yte_df.index[n_obs:]
             with torch.no_grad():
                 for j, (x, y, y_perf) in enumerate(test_dev):
                     # Predict and optimize
@@ -1191,11 +1261,7 @@ class e2e_net(nn.Module):
             # Window boundary: let the recorder compute lazy diagnostics for this window (it only
             # does work if the window saw a retry/fallback). Passes the standardized train slice.
             if self._recorder is not None:
-                self._recorder.on_window(self, i, test_dates, Xtr, Y.train())
-
-
-        # Reset dataset
-        X, Y = X.split_update(init_split), Y.split_update(init_split)
+                self._recorder.on_window(self, i, test_dates, Xtr, Ytr_df)
 
         # Calculate the portfolio statistics using the realized portfolio returns
         portfolio.stats()

@@ -12,6 +12,7 @@ from torch.autograd import Variable
 import e2edro.RiskFunctions as rf
 import e2edro.PortfolioClasses as pc
 import e2edro.e2edro as e2e
+from e2edro.progress import track
 
 
 
@@ -21,7 +22,7 @@ import e2edro.e2edro as e2e
 class pred_then_opt(nn.Module):
     """Naive 'predict-then-optimize' portfolio construction module
     """
-    def __init__(self, n_x, n_y, n_obs, epsilon=0.5, set_seed=42, prisk='p_var', opt_layer='nominal', cache_path='./cache/', max_weight=1.0, long_short=False, solver_args=None, solve_retry_args=None, solve_fallback=False):
+    def __init__(self, n_x, n_y, n_obs, epsilon=0.5, set_seed=42, prisk='p_var', opt_layer='nominal', cache_path='./cache/', max_weight=1.0, long_short=False, periods_per_year=52, solver_args=None, solve_retry_args=None, solve_fallback=False):
         """Naive 'predict-then-optimize' portfolio construction module
 
         This NN module implements a linear prediction layer 'pred_layer' and an optimization layer 
@@ -49,6 +50,7 @@ class pred_then_opt(nn.Module):
         self.n_obs = n_obs
         self.max_weight = max_weight  # Max weight per asset for diversification
         self.long_short = long_short  # Allow short positions if True
+        self.periods_per_year = periods_per_year  # annualization factor (freq-aware; see backtest)
         self.perf_period = 13
 
         # Feasibility: an active per-asset cap must admit a feasible budget (sum(z)==1).
@@ -168,7 +170,7 @@ class pred_then_opt(nn.Module):
     #-----------------------------------------------------------------------------------------------
     # net_test: Test the e2e neural net
     #-----------------------------------------------------------------------------------------------
-    def net_roll_test(self, X, Y, n_roll=4):
+    def net_roll_test(self, X, Y, n_roll=4, progress=True):
         """Neural net rolling window out-of-sample test
 
         Inputs
@@ -180,43 +182,47 @@ class pred_then_opt(nn.Module):
         self.portfolio: add the backtest results to the e2e_net object
         """
 
-        # Declare backtest object to hold the test results
-        portfolio = pc.backtest(len(Y.test())-Y.n_obs, self.n_y, Y.test().index[Y.n_obs:])
+        # Roll boundaries as absolute integer positions from the split. The portfolio is sized from
+        # the SAME edges that drive the fills (allocation == fills by construction), and X/Y are
+        # sliced with .iloc -- never mutating the passed TrainTest and never assuming the split sums
+        # to 1 (a partial split simply yields edges[-1] < len(data) and the rolls stop there).
+        n_obs = self.n_obs
+        N = len(Y.data)
+        train_frac, test_frac = Y.split
+        edges = [round(N * (train_frac + test_frac * k / n_roll)) for k in range(n_roll + 1)]
+        if edges[0] < n_obs:
+            raise ValueError(
+                f"Insufficient training data: first-roll train window ends at position "
+                f"{edges[0]} < n_obs={n_obs}. Use a larger train fraction or a smaller n_obs."
+            )
 
-        # Store initial train/test split
-        init_split = Y.split
-
-        # Window size
-        win_size = init_split[1] / n_roll
-
-        split = [0, 0]
+        portfolio = pc.backtest(edges[-1] - edges[0], self.n_y, Y.data.index[edges[0]:edges[-1]],
+                                periods_per_year=self.periods_per_year)
         t = 0
-        for i in range(n_roll):
-
-            print(f"Out-of-sample window: {i+1} / {n_roll}")
+        rolls = track(range(n_roll), total=n_roll, desc=f'{getattr(self, "_name", "PO")} roll',
+                      enable=progress, leave=False)
+        for i in rolls:
             self._solve_window = i          # tag every solve in this window (report context)
+            rolls.set_postfix(window=f'{i+1}/{n_roll}')
 
-            split[0] = init_split[0] + win_size * i
-            if i < n_roll-1:
-                split[1] = win_size
-            else:
-                split[1] = 1 - split[0]
-
-            X.split_update(split), Y.split_update(split)
+            Xtr_df = X.data.iloc[:edges[i]]
+            Ytr_df = Y.data.iloc[:edges[i]]
+            Xte_df = X.data.iloc[edges[i] - n_obs:edges[i + 1]]   # +n_obs lookback for the window
+            Yte_df = Y.data.iloc[edges[i] - n_obs:edges[i + 1]]
 
             # Re-fit feature standardization on this roll's train window, apply to its test window.
-            mu = X.train().mean()
-            sigma = X.train().std().replace(0.0, 1.0)
-            Xtr, Xte = (X.train() - mu) / sigma, (X.test() - mu) / sigma
+            mu = Xtr_df.mean()
+            sigma = Xtr_df.std().replace(0.0, 1.0)
+            Xtr, Xte = (Xtr_df - mu) / sigma, (Xte_df - mu) / sigma
 
-            test_set = DataLoader(pc.SlidingWindow(Xte, Y.test(), self.n_obs, 1))
+            test_set = DataLoader(pc.SlidingWindow(Xte, Yte_df, n_obs, 1))
 
             # OLS warm-start + (base_rom) Sigma_mu_hat build, in one call.
-            self.fit_predictor(Xtr, Y.train())
+            self.fit_predictor(Xtr, Ytr_df)
 
             # Test model  (predict-then-optimize is inference-only: no training phase)
             self._solve_phase = 'infer'
-            test_dates = Y.test().index[self.n_obs:]
+            test_dates = Yte_df.index[n_obs:]
             with torch.no_grad():
                 for j, (x, y, y_perf) in enumerate(test_set):
 
@@ -232,10 +238,7 @@ class pred_then_opt(nn.Module):
 
             # Window boundary: recorder computes lazy diagnostics only if this window failed.
             if self._recorder is not None:
-                self._recorder.on_window(self, i, test_dates, Xtr, Y.train())
-
-        # Reset dataset
-        X, Y = X.split_update(init_split), Y.split_update(init_split)
+                self._recorder.on_window(self, i, test_dates, Xtr, Ytr_df)
 
         # Calculate the portfolio statistics using the realized portfolio returns
         portfolio.stats()
@@ -273,7 +276,7 @@ class pred_then_opt(nn.Module):
 class equal_weight:
     """Naive 'equally-weighted' portfolio construction module
     """
-    def __init__(self, n_x, n_y, n_obs):
+    def __init__(self, n_x, n_y, n_obs, periods_per_year=52):
         """Naive 'equally-weighted' portfolio construction module
 
         This object implements a basic equally-weighted investment strategy.
@@ -287,7 +290,8 @@ class equal_weight:
         self.n_y = n_y
         self.n_obs = n_obs
         self.perf_period = 13
-    
+        self.periods_per_year = periods_per_year  # annualization factor (freq-aware; see backtest)
+
     #-----------------------------------------------------------------------------------------------
     # net_test: Test the e2e neural net
     #-----------------------------------------------------------------------------------------------
@@ -304,7 +308,8 @@ class equal_weight:
         """
 
         # Declare backtest object to hold the test results
-        portfolio = pc.backtest(len(Y.test())-Y.n_obs, self.n_y, Y.test().index[Y.n_obs:])
+        portfolio = pc.backtest(len(Y.test())-Y.n_obs, self.n_y, Y.test().index[Y.n_obs:],
+                                periods_per_year=self.periods_per_year)
 
         test_set = DataLoader(pc.SlidingWindow(X.test(), Y.test(), self.n_obs, 1))
 
